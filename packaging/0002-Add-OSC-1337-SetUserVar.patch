@@ -1,0 +1,289 @@
+From cc708d75c7d121a4b025865f9a7c7f0ba89cb147 Mon Sep 17 00:00:00 2001
+From: Eric Duprey <509630+destinal@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 12:55:33 -0700
+Subject: [PATCH 02/17] Add OSC 1337 SetUserVar
+
+Programs can now attach variables to a session with the iTerm2 escape
+sequence OSC 1337 ; SetUserVar=<name>=<base64 value>, which WezTerm and
+kitty also support. Each change emits Session::userVarChanged, and the
+variables can be read and set over D-Bus with userVar(), setUserVar()
+and userVarNames().
+
+Names are limited to letters, digits and -_+. ; invalid base64 is
+ignored. A session holds at most 256 variables of up to 64 KiB each, so
+a program cannot make Konsole hold unbounded data.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/Emulation.h                      | 10 ++++++++
+ src/Vt102Emulation.cpp               | 14 +++++++++++
+ src/autotests/SessionTest.cpp        | 35 ++++++++++++++++++++++++++++
+ src/autotests/SessionTest.h          |  1 +
+ src/autotests/Vt102EmulationTest.cpp | 34 +++++++++++++++++++++++++++
+ src/autotests/Vt102EmulationTest.h   |  1 +
+ src/session/Session.cpp              | 33 ++++++++++++++++++++++++++
+ src/session/Session.h                | 15 ++++++++++++
+ 8 files changed, 143 insertions(+)
+
+diff --git a/src/Emulation.h b/src/Emulation.h
+index 42cd770..d774157 100644
+--- a/src/Emulation.h
++++ b/src/Emulation.h
+@@ -445,6 +445,16 @@ Q_SIGNALS:
+      */
+     void osc777Received(const QStringList &params);
+ 
++    /**
++     * Emitted after receiving the iTerm2 escape sequence
++     * OSC 1337 ; SetUserVar=<name>=<base64 value>, which sets a
++     * user-defined variable on the session.
++     *
++     * @param name The variable name
++     * @param value The decoded value; empty when the sequence carried none
++     */
++    void userVarChanged(const QString &name, const QString &value);
++
+     /**
+      * Mainly used to communicate dropped lines to active autosave tasks.
+      * Takes into account lines dropped by Screen::addHistLine and Screen::fastAddHistLine.
+diff --git a/src/Vt102Emulation.cpp b/src/Vt102Emulation.cpp
+index 614bd8d..3773a7d 100644
+--- a/src/Vt102Emulation.cpp
++++ b/src/Vt102Emulation.cpp
+@@ -1670,6 +1670,20 @@ void Vt102Emulation::processSessionAttributeRequest(const int tokenSize, const u
+     }
+ 
+     if (attribute == Image) {
++        // printf '\e]1337;SetUserVar=%s=%s\a' name "$(printf %s value | base64 -w0)"
++        const QLatin1String setUserVar("SetUserVar=");
++        if (value.startsWith(setUserVar)) {
++            const QStringView assignment = QStringView(value).mid(setUserVar.size());
++            const qsizetype separator = assignment.indexOf(QLatin1Char('='));
++            const QString name = (separator < 0 ? assignment : assignment.left(separator)).toString();
++            const QByteArray encoded = separator < 0 ? QByteArray() : assignment.mid(separator + 1).toLatin1();
++            const auto decoded = QByteArray::fromBase64Encoding(encoded, QByteArray::AbortOnBase64DecodingErrors);
++            if (!name.isEmpty() && isIdentifier(name) && decoded) {
++                Q_EMIT userVarChanged(name, QString::fromUtf8(decoded.decoded));
++            }
++            return;
++        }
++
+         bool inlineImage = false;
+         bool inlineMedia = false;
+         if (value.startsWith(QLatin1String("ReportCellSize"))) {
+diff --git a/src/autotests/SessionTest.cpp b/src/autotests/SessionTest.cpp
+index f6c0d23..9059c0e 100644
+--- a/src/autotests/SessionTest.cpp
++++ b/src/autotests/SessionTest.cpp
+@@ -7,6 +7,7 @@
+ // Own
+ #include "SessionTest.h"
+ 
++#include <QSignalSpy>
+ #include <QTest>
+ 
+ // Konsole
+@@ -42,6 +43,40 @@ void SessionTest::testEmulation()
+     delete session;
+ }
+ 
++void SessionTest::testUserVars()
++{
++    auto session = new Session();
++    QSignalSpy changed(session, &Session::userVarChanged);
++
++    // The escape sequence reaches the session through the emulation.
++    const char sequence[] = "\033]1337;SetUserVar=cc_status=d29ya2luZw==\007";
++    session->emulation()->receiveData(sequence, sizeof(sequence) - 1);
++    QCOMPARE(session->userVar(QStringLiteral("cc_status")), QStringLiteral("working"));
++    QCOMPARE(changed.count(), 1);
++
++    // Setting the same value again does not signal.
++    session->setUserVar(QStringLiteral("cc_status"), QStringLiteral("working"));
++    QCOMPARE(changed.count(), 1);
++
++    session->setUserVar(QStringLiteral("cc_status"), QStringLiteral("idle"));
++    QCOMPARE(session->userVar(QStringLiteral("cc_status")), QStringLiteral("idle"));
++    QCOMPARE(changed.count(), 2);
++
++    // Invalid names and oversized values are refused.
++    session->setUserVar(QStringLiteral("bad name"), QStringLiteral("x"));
++    session->setUserVar(QStringLiteral("big"), QString(64 * 1024 + 1, QLatin1Char('x')));
++    QCOMPARE(session->userVarNames(), QStringList{QStringLiteral("cc_status")});
++
++    // At most 256 variables are held.
++    for (int i = 0; i < 300; i++) {
++        session->setUserVar(QStringLiteral("v%1").arg(i), QStringLiteral("x"));
++    }
++    QCOMPARE(session->userVarNames().size(), 256);
++    QCOMPARE(session->userVar(QStringLiteral("cc_status")), QStringLiteral("idle"));
++
++    delete session;
++}
++
+ QTEST_MAIN(SessionTest)
+ 
+ #include "moc_SessionTest.cpp"
+diff --git a/src/autotests/SessionTest.h b/src/autotests/SessionTest.h
+index e804a37..c9f1786 100644
+--- a/src/autotests/SessionTest.h
++++ b/src/autotests/SessionTest.h
+@@ -18,6 +18,7 @@ class SessionTest : public QObject
+ private Q_SLOTS:
+     void testNoProfile();
+     void testEmulation();
++    void testUserVars();
+ 
+ private:
+ };
+diff --git a/src/autotests/Vt102EmulationTest.cpp b/src/autotests/Vt102EmulationTest.cpp
+index 80a1a0a..020e9db 100644
+--- a/src/autotests/Vt102EmulationTest.cpp
++++ b/src/autotests/Vt102EmulationTest.cpp
+@@ -799,6 +799,40 @@ void Vt102EmulationTest::testProgressStates()
+     QCOMPARE(reports, expected);
+ }
+ 
++void Vt102EmulationTest::testSetUserVar()
++{
++    TestEmulation em;
++    em.reset();
++    em.setCodec(TestEmulation::Utf8Codec);
++
++    QList<QPair<QString, QString>> vars;
++    connect(&em, &Emulation::userVarChanged, this, [&vars](const QString &name, const QString &value) {
++        vars.append({name, value});
++    });
++    auto send = [&em](const char *sequence) {
++        em.receiveData(sequence, strlen(sequence));
++    };
++
++    // "d29ya2luZw==" is "working"; "w6k=" is "\u00e9" in UTF-8.
++    send("\033]1337;SetUserVar=cc_status=d29ya2luZw==\007");
++    send("\033]1337;SetUserVar=accent=w6k=\033\\");
++    // A variable with no value is set to the empty string.
++    send("\033]1337;SetUserVar=empty=\007");
++    send("\033]1337;SetUserVar=bare\007");
++    // Invalid base64 and invalid names are ignored.
++    send("\033]1337;SetUserVar=bad=not*base64\007");
++    send("\033]1337;SetUserVar=bad name=d29ya2luZw==\007");
++    send("\033]1337;SetUserVar==d29ya2luZw==\007");
++
++    const QList<QPair<QString, QString>> expected = {
++        {QStringLiteral("cc_status"), QStringLiteral("working")},
++        {QStringLiteral("accent"), QString(QChar(0xe9))},
++        {QStringLiteral("empty"), QString()},
++        {QStringLiteral("bare"), QString()},
++    };
++    QCOMPARE(vars, expected);
++}
++
+ QTEST_GUILESS_MAIN(Vt102EmulationTest)
+ 
+ #include "moc_Vt102EmulationTest.cpp"
+diff --git a/src/autotests/Vt102EmulationTest.h b/src/autotests/Vt102EmulationTest.h
+index 1096fe1..cb277e1 100644
+--- a/src/autotests/Vt102EmulationTest.h
++++ b/src/autotests/Vt102EmulationTest.h
+@@ -45,6 +45,7 @@ private Q_SLOTS:
+     void testKittyKeyboardTextKeys();
+ 
+     void testProgressStates();
++    void testSetUserVar();
+ 
+ private:
+     static void sendAndCompare(TestEmulation *em, const char *input, size_t inputLen, const QString &expectedPrint, const QByteArray &expectedSent);
+diff --git a/src/session/Session.cpp b/src/session/Session.cpp
+index b7057cb..7b71ffe 100644
+--- a/src/session/Session.cpp
++++ b/src/session/Session.cpp
+@@ -129,6 +129,7 @@ Session::Session(QObject *parent)
+ 
+     connect(_emulation, &Konsole::Emulation::sessionAttributeChanged, this, &Konsole::Session::setSessionAttribute);
+     connect(_emulation, &Konsole::Emulation::osc777Received, this, &Konsole::Session::handleOsc777);
++    connect(_emulation, &Konsole::Emulation::userVarChanged, this, &Konsole::Session::setUserVar);
+     connect(_emulation, &Konsole::Emulation::bell, this, [this]() {
+         Q_EMIT bellRequest(i18n("Bell in '%1' (Session '%2')", _displayTitle, _nameTitle));
+         this->setPendingNotification(Notification::Bell);
+@@ -2429,6 +2430,38 @@ QString Session::tabColor() const
+     return _tabColor.name();
+ }
+ 
++QString Session::userVar(const QString &name) const
++{
++    return _userVars.value(name);
++}
++
++void Session::setUserVar(const QString &name, const QString &value)
++{
++    // Bound what a program can make the session hold.
++    constexpr int maxUserVars = 256;
++    constexpr int maxUserVarLength = 64 * 1024;
++    static const QRegularExpression nameRe(QStringLiteral("^[-a-zA-Z0-9_+.]+$"));
++
++    if (!nameRe.match(name).hasMatch() || value.size() > maxUserVarLength) {
++        return;
++    }
++    const auto existing = _userVars.constFind(name);
++    if (existing == _userVars.cend() && _userVars.size() >= maxUserVars) {
++        return;
++    }
++    if (existing != _userVars.cend() && *existing == value) {
++        return;
++    }
++
++    _userVars.insert(name, value);
++    Q_EMIT userVarChanged(name, value);
++}
++
++QStringList Session::userVarNames() const
++{
++    return _userVars.keys();
++}
++
+ void Session::setActivityColor(const QColor &color)
+ {
+     if (_tabActivityColor == color) {
+diff --git a/src/session/Session.h b/src/session/Session.h
+index 8388fcf..3d641d3 100644
+--- a/src/session/Session.h
++++ b/src/session/Session.h
+@@ -848,6 +848,16 @@ public Q_SLOTS:
+     Q_SCRIPTABLE QString tabColor() const;
+     Q_SCRIPTABLE void setTabColor(const QString &colorName);
+ 
++    /**
++     * Sets/gets a user-defined variable, as set by programs with the
++     * escape sequence OSC 1337 ; SetUserVar=<name>=<base64 value>.
++     * Names are limited to letters, digits and -_+. ; a session holds at
++     * most 256 variables of up to 64 KiB each.
++     */
++    Q_SCRIPTABLE QString userVar(const QString &name) const;
++    Q_SCRIPTABLE void setUserVar(const QString &name, const QString &value);
++    Q_SCRIPTABLE QStringList userVarNames() const;
++
+ Q_SIGNALS:
+ 
+     /** Emitted when the terminal process starts. */
+@@ -864,6 +874,9 @@ Q_SIGNALS:
+      */
+     void sessionAttributeChanged();
+ 
++    /** Emitted when a user-defined variable is set to a new value. */
++    void userVarChanged(const QString &name, const QString &value);
++
+     /** Emitted when the session gets locked / unlocked. */
+     void readOnlyChanged();
+ 
+@@ -1066,6 +1079,8 @@ private:
+     bool _tabColorSetByUser = false;
+     bool _tabActivityColorSetByUser = false;
+ 
++    QHash<QString, QString> _userVars;
++
+     // Badge properties
+     bool _badgeEnabled = false;
+     QString _badgeText;
+-- 
+2.56.0
+

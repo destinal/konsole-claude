@@ -1,0 +1,894 @@
+From 9834b9f8a98905beb96b8ac56dfff7a886b4b652 Mon Sep 17 00:00:00 2001
+From: Eric Duprey <509630+destinal@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 14:29:11 -0700
+Subject: [PATCH 13/17] Claude Code plugin: workgroups
+
+A Claude Code workgroup, after iTerm2's: the session running Claude Code
+(Chat) with two more members, Diff and Code Review. They share the Chat
+session's tab as splits, one maximized at a time. A Chat | Diff |
+Code Review switcher in each member's header bar, or Ctrl+Alt+1/2/3,
+shows another.
+
+- A session enters a workgroup when Claude Code starts in it, which its
+  first OSC 7501 report shows, and leaves it when Claude Code exits
+  there: once it clears its status and only the shell is left in the
+  foreground. Closing any member ends the workgroup. Automatic entry can
+  be turned off ([ClaudeCode] AutoEnterWorkgroup); Enter and Exit Claude
+  Workgroup work by hand.
+- Diff runs nothing until it is first shown, then waits for staged or
+  unstaged changes and runs git difftool -y -x vimdiff against HEAD
+  ($CLAUDECODE_DIFF_COMMAND overrides it). Enter runs it again.
+- Code Review starts nothing until asked: Enter starts Claude Code with
+  the review prompt, e edits it. The prompt is iTerm2's default code
+  review prompt, copied to ~/.config/konsole-claudecode on first use.
+- Members start in the Chat session's directory, with its profile, the
+  tools directory on PATH, and TERM_SESSION_ID naming the Chat session,
+  so a review can file findings with it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/plugins/ClaudeCode/CMakeLists.txt         |  16 +-
+ src/plugins/ClaudeCode/claudecodeplugin.cpp   |  45 ++++-
+ .../ClaudeCode/sessionstatusregistry.cpp      |   3 +
+ .../ClaudeCode/sessionstatusregistry.h        |   4 +
+ src/plugins/ClaudeCode/workgroup.cpp          | 179 ++++++++++++++++++
+ src/plugins/ClaudeCode/workgroup.h            |  77 ++++++++
+ .../ClaudeCode/workgroup/claudecode-diff      |  43 +++++
+ .../ClaudeCode/workgroup/claudecode-review    |  56 ++++++
+ .../ClaudeCode/workgroup/review-prompt.txt    |  11 ++
+ src/plugins/ClaudeCode/workgroupmanager.cpp   | 139 ++++++++++++++
+ src/plugins/ClaudeCode/workgroupmanager.h     |  60 ++++++
+ src/plugins/ClaudeCode/workgroupswitcher.cpp  |  37 ++++
+ src/plugins/ClaudeCode/workgroupswitcher.h    |  33 ++++
+ 13 files changed, 701 insertions(+), 2 deletions(-)
+ create mode 100644 src/plugins/ClaudeCode/workgroup.cpp
+ create mode 100644 src/plugins/ClaudeCode/workgroup.h
+ create mode 100755 src/plugins/ClaudeCode/workgroup/claudecode-diff
+ create mode 100755 src/plugins/ClaudeCode/workgroup/claudecode-review
+ create mode 100644 src/plugins/ClaudeCode/workgroup/review-prompt.txt
+ create mode 100644 src/plugins/ClaudeCode/workgroupmanager.cpp
+ create mode 100644 src/plugins/ClaudeCode/workgroupmanager.h
+ create mode 100644 src/plugins/ClaudeCode/workgroupswitcher.cpp
+ create mode 100644 src/plugins/ClaudeCode/workgroupswitcher.h
+
+diff --git a/src/plugins/ClaudeCode/CMakeLists.txt b/src/plugins/ClaudeCode/CMakeLists.txt
+index c4ca54c..8b10e7a 100644
+--- a/src/plugins/ClaudeCode/CMakeLists.txt
++++ b/src/plugins/ClaudeCode/CMakeLists.txt
+@@ -6,6 +6,9 @@ SOURCES
+     claudesessionswidget.cpp
+     sessionnavigation.cpp
+     statusnotifier.cpp
++    workgroup.cpp
++    workgroupmanager.cpp
++    workgroupswitcher.cpp
+     programstatusrecords.cpp
+     sessionstatus.cpp
+     sessionstatusregistry.cpp
+@@ -24,7 +27,18 @@ target_link_libraries(konsole_claudecodeplugin
+     KF6::Notifications
+     KF6::WindowSystem
+ )
+-target_compile_definitions(konsole_claudecodeplugin PRIVATE -DRELEASE_SERVICE_VERSION="${RELEASE_SERVICE_VERSION}")
++target_compile_definitions(konsole_claudecodeplugin PRIVATE
++    -DRELEASE_SERVICE_VERSION="${RELEASE_SERVICE_VERSION}"
++    -DCLAUDECODE_TOOLS_DIRECTORY="${KDE_INSTALL_FULL_LIBEXECDIR}/konsole-claudecode"
++)
++
++# The workgroup's member scripts, beside it2 and the hook. review-prompt.txt
++# is iTerm2's default code review prompt.
++foreach(file claudecode-diff claudecode-review review-prompt.txt)
++    configure_file(workgroup/${file} ${CMAKE_BINARY_DIR}/bin/claudecode/${file} COPYONLY)
++endforeach()
++install(PROGRAMS workgroup/claudecode-diff workgroup/claudecode-review DESTINATION ${KDE_INSTALL_LIBEXECDIR}/konsole-claudecode)
++install(FILES workgroup/review-prompt.txt DESTINATION ${KDE_INSTALL_LIBEXECDIR}/konsole-claudecode)
+ 
+ add_subdirectory(it2)
+ 
+diff --git a/src/plugins/ClaudeCode/claudecodeplugin.cpp b/src/plugins/ClaudeCode/claudecodeplugin.cpp
+index 125e161..4f3b8fb 100644
+--- a/src/plugins/ClaudeCode/claudecodeplugin.cpp
++++ b/src/plugins/ClaudeCode/claudecodeplugin.cpp
+@@ -11,8 +11,10 @@
+ #include "sessionstatusregistry.h"
+ #include "statusbadges.h"
+ #include "statusnotifier.h"
++#include "workgroupmanager.h"
+ 
+ #include "MainWindow.h"
++#include "ViewManager.h"
+ #include "session/Session.h"
+ #include "session/SessionController.h"
+ #include "terminalDisplay/TerminalDisplay.h"
+@@ -29,6 +31,7 @@ struct ClaudeCodePlugin::Private {
+     SessionStatusRegistry *registry = nullptr;
+     ClaudeSessionsModel *model = nullptr;
+     StatusBadges *badges = nullptr;
++    WorkgroupManager *workgroups = nullptr;
+     QMap<Konsole::MainWindow *, QDockWidget *> dockForWindow;
+ };
+ 
+@@ -42,6 +45,7 @@ ClaudeCodePlugin::ClaudeCodePlugin(QObject *object, const QVariantList &args)
+     priv->model = new ClaudeSessionsModel(priv->registry, this);
+     new StatusNotifier(priv->registry, this);
+     priv->badges = new StatusBadges(priv->registry, this);
++    priv->workgroups = new WorkgroupManager(priv->registry, this);
+ 
+     // The session's tab shows its status as a colored dot.
+     connect(priv->registry, &SessionStatusRegistry::statusChanged, this, [this](Konsole::Session *session) {
+@@ -121,7 +125,46 @@ QList<QAction *> ClaudeCodePlugin::menuBarActions(Konsole::MainWindow *mainWindo
+     // One setting for every window: keep each window's menu in step.
+     connect(priv->badges, &StatusBadges::enabledChanged, badgesAction, &QAction::setChecked);
+ 
+-    return {toggleVisibilityAction, badgesAction};
++    // Workgroups act on the window's active session.
++    auto activeSession = [mainWindow]() -> Konsole::Session * {
++        Konsole::SessionController *controller = mainWindow->viewManager()->activeViewController();
++        return controller != nullptr ? controller->session().data() : nullptr;
++    };
++
++    auto *enterAction = new QAction(i18n("Enter Claude Workgroup"), mainWindow);
++    mainWindow->actionCollection()->addAction(QStringLiteral("claudecode-enter-workgroup"), enterAction);
++    connect(enterAction, &QAction::triggered, priv->workgroups, [this, activeSession] {
++        priv->workgroups->enter(activeSession());
++    });
++
++    auto *exitAction = new QAction(i18n("Exit Claude Workgroup"), mainWindow);
++    mainWindow->actionCollection()->addAction(QStringLiteral("claudecode-exit-workgroup"), exitAction);
++    connect(exitAction, &QAction::triggered, priv->workgroups, [this, activeSession] {
++        priv->workgroups->exit(activeSession());
++    });
++
++    QList<QAction *> memberActions;
++    const QStringList names = Workgroup::memberNames();
++    for (int member = 0; member < Workgroup::memberCount; member++) {
++        auto *action = new QAction(i18nc("@action show a workgroup member", "Show %1", names.at(member)), mainWindow);
++        mainWindow->actionCollection()->addAction(QStringLiteral("claudecode-workgroup-member-%1").arg(member), action);
++        mainWindow->actionCollection()->setDefaultShortcut(action, QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key(Qt::Key_1 + member)));
++        connect(action, &QAction::triggered, priv->workgroups, [this, activeSession, member] {
++            if (Workgroup *workgroup = priv->workgroups->workgroup(activeSession())) {
++                workgroup->show(Workgroup::Member(member));
++            }
++        });
++        memberActions.append(action);
++    }
++
++    auto *autoEnterAction = new QAction(i18n("Enter Claude Workgroups Automatically"), mainWindow);
++    autoEnterAction->setCheckable(true);
++    autoEnterAction->setChecked(priv->workgroups->autoEnter());
++    mainWindow->actionCollection()->addAction(QStringLiteral("claudecode-auto-enter-workgroup"), autoEnterAction);
++    connect(autoEnterAction, &QAction::toggled, priv->workgroups, &WorkgroupManager::setAutoEnter);
++    connect(priv->workgroups, &WorkgroupManager::autoEnterChanged, autoEnterAction, &QAction::setChecked);
++
++    return QList<QAction *>{toggleVisibilityAction, badgesAction, enterAction, exitAction} + memberActions + QList<QAction *>{autoEnterAction};
+ }
+ 
+ #include "claudecodeplugin.moc"
+diff --git a/src/plugins/ClaudeCode/sessionstatusregistry.cpp b/src/plugins/ClaudeCode/sessionstatusregistry.cpp
+index df4c7d7..4685d39 100644
+--- a/src/plugins/ClaudeCode/sessionstatusregistry.cpp
++++ b/src/plugins/ClaudeCode/sessionstatusregistry.cpp
+@@ -63,6 +63,9 @@ void SessionStatusRegistry::track(Konsole::Session *session)
+     Konsole::Emulation *emulation = session->emulation();
+     connect(emulation, &Konsole::Emulation::progressChanged, status, &SessionStatus::progressReported);
+     connect(emulation, &Konsole::Emulation::programStatusReported, programStatus, &ProgramStatusController::handle);
++    connect(emulation, &Konsole::Emulation::programStatusReported, this, [this, session](const Konsole::ProgramStatusReport &report) {
++        Q_EMIT programStatusReported(session, report);
++    });
+     connect(emulation, &Konsole::Emulation::promptStarted, programStatus, &ProgramStatusController::promptStarted);
+     connect(emulation, &Konsole::Emulation::terminalReset, programStatus, &ProgramStatusController::terminalReset);
+     connect(session, &Konsole::Session::tabStatusReceived, status, [status](const Konsole::TabStatusUpdate &update) {
+diff --git a/src/plugins/ClaudeCode/sessionstatusregistry.h b/src/plugins/ClaudeCode/sessionstatusregistry.h
+index 661eed8..413d63b 100644
+--- a/src/plugins/ClaudeCode/sessionstatusregistry.h
++++ b/src/plugins/ClaudeCode/sessionstatusregistry.h
+@@ -13,6 +13,7 @@
+ namespace Konsole
+ {
+ class Session;
++struct ProgramStatusReport;
+ }
+ class SessionStatus;
+ class ProgramStatusController;
+@@ -47,6 +48,9 @@ Q_SIGNALS:
+     /** Something visible about @p session's status changed. */
+     void statusChanged(Konsole::Session *session, const std::optional<QString> &previousStatusText);
+ 
++    /** @p session's program sent a Program Status Protocol report (OSC 7501). */
++    void programStatusReported(Konsole::Session *session, const Konsole::ProgramStatusReport &report);
++
+ private:
+     void track(Konsole::Session *session);
+ 
+diff --git a/src/plugins/ClaudeCode/workgroup.cpp b/src/plugins/ClaudeCode/workgroup.cpp
+new file mode 100644
+index 0000000..c6b914e
+--- /dev/null
++++ b/src/plugins/ClaudeCode/workgroup.cpp
+@@ -0,0 +1,179 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "workgroup.h"
++#include "workgroupswitcher.h"
++
++#include "MainWindow.h"
++#include "ViewManager.h"
++#include "profile/Profile.h"
++#include "session/Session.h"
++#include "session/SessionManager.h"
++#include "terminalDisplay/TerminalDisplay.h"
++#include "widgets/TerminalHeaderBar.h"
++#include "widgets/ViewContainer.h"
++#include "widgets/ViewSplitter.h"
++
++#include <KLocalizedString>
++
++#include <QBoxLayout>
++#include <QDBusConnection>
++#include <QProcessEnvironment>
++
++QStringList Workgroup::memberNames()
++{
++    return {i18nc("@action:button workgroup member", "Chat"),
++            i18nc("@action:button workgroup member", "Diff"),
++            i18nc("@action:button workgroup member", "Code Review")};
++}
++
++Workgroup::Workgroup(Konsole::Session *chat, const QString &toolsDirectory, QObject *parent)
++    : QObject(parent)
++{
++    _sessions[Chat] = chat;
++    _sessions[Diff] = createMember(Diff, toolsDirectory);
++    _sessions[Review] = createMember(Review, toolsDirectory);
++
++    for (int member = 0; member < memberCount; member++) {
++        Konsole::Session *session = _sessions[member];
++        if (session == nullptr) {
++            continue;
++        }
++        addSwitcher(Member(member));
++        // Closing any member ends the workgroup, as in iTerm2.
++        connect(session, &QObject::destroyed, this, &Workgroup::dissolve);
++    }
++    show(Chat);
++}
++
++Workgroup::~Workgroup() = default;
++
++Konsole::Session *Workgroup::createMember(Member member, const QString &toolsDirectory)
++{
++    Konsole::Session *chat = _sessions[Chat];
++    Konsole::TerminalDisplay *chatView = view(Chat);
++    auto *window = chatView != nullptr ? qobject_cast<Konsole::MainWindow *>(chatView->window()) : nullptr;
++    if (window == nullptr) {
++        return nullptr;
++    }
++    Konsole::ViewManager *viewManager = window->viewManager();
++
++    // The members split the Chat session's view, in its directory.
++    viewManager->setCurrentSession(chat->sessionId());
++    auto profile = Konsole::SessionManager::instance()->sessionProfile(chat);
++    Konsole::Session *session = viewManager->createSession(profile, chat->currentWorkingDirectory());
++
++    const QString script = toolsDirectory + (member == Diff ? QLatin1String("/claudecode-diff") : QLatin1String("/claudecode-review"));
++    session->setProgram(QStringLiteral("/bin/bash"));
++    session->setArguments({QStringLiteral("/bin/bash"), script});
++    // A review runs it2 to file its findings with the Chat session.
++    const QString path = QProcessEnvironment::systemEnvironment().value(QStringLiteral("PATH"));
++    session->addEnvironmentEntry(QStringLiteral("PATH=%1:%2").arg(toolsDirectory, path));
++    session->addEnvironmentEntry(
++        QStringLiteral("TERM_SESSION_ID=konsole:%1/Sessions/%2").arg(QDBusConnection::sessionBus().baseService()).arg(chat->sessionId()));
++    session->setTitle(Konsole::Session::NameRole, memberNames().at(member));
++
++    Konsole::TerminalDisplay *display = viewManager->createView(session);
++    viewManager->activeContainer()->splitView(display, Qt::Horizontal);
++    return session;
++}
++
++Konsole::Session *Workgroup::session(Member member) const
++{
++    return _sessions[member];
++}
++
++bool Workgroup::contains(Konsole::Session *session) const
++{
++    return std::find(_sessions.begin(), _sessions.end(), session) != _sessions.end();
++}
++
++Workgroup::Member Workgroup::current() const
++{
++    return _current;
++}
++
++Konsole::TerminalDisplay *Workgroup::view(Member member) const
++{
++    Konsole::Session *session = _sessions[member];
++    if (session == nullptr || session->views().isEmpty()) {
++        return nullptr;
++    }
++    return session->views().first();
++}
++
++void Workgroup::addSwitcher(Member member)
++{
++    Konsole::TerminalDisplay *display = view(member);
++    auto *layout = display != nullptr ? qobject_cast<QBoxLayout *>(display->headerBar()->layout()) : nullptr;
++    if (layout == nullptr) {
++        return;
++    }
++    auto *switcher = new WorkgroupSwitcher(memberNames(), display->headerBar());
++    // After the session's icon, before its title.
++    layout->insertWidget(1, switcher);
++    connect(switcher, &WorkgroupSwitcher::memberChosen, this, [this](int chosen) {
++        show(Member(chosen));
++    });
++    _switchers.append(switcher);
++}
++
++void Workgroup::show(Member member)
++{
++    Konsole::TerminalDisplay *display = view(member);
++    if (display == nullptr) {
++        return;
++    }
++    Konsole::ViewSplitter *splitter = Konsole::ViewSplitter::parentSplitterForDisplay(display);
++    if (splitter == nullptr) {
++        return;
++    }
++    Konsole::ViewSplitter *top = splitter->getToplevelSplitter();
++    top->clearMaximized();
++    display->setFocus(Qt::OtherFocusReason);
++    // Maximizes the focused view, hiding the others.
++    top->toggleMaximizeCurrentTerminal();
++
++    _current = member;
++    for (const auto &switcher : std::as_const(_switchers)) {
++        if (switcher != nullptr) {
++            switcher->setCurrent(member);
++        }
++    }
++
++    // The diff waits to be seen, so that it shows the changes as they are then.
++    if (member == Diff && !_diffStarted) {
++        _diffStarted = true;
++        _sessions[Diff]->sendTextToTerminal(QString(), QLatin1Char('\r'));
++    }
++}
++
++void Workgroup::dissolve()
++{
++    if (_dissolving) {
++        return;
++    }
++    _dissolving = true;
++
++    for (const auto &switcher : std::as_const(_switchers)) {
++        delete switcher.data();
++    }
++    _switchers.clear();
++
++    // Show Chat on its own again, then close the others.
++    if (Konsole::TerminalDisplay *display = view(Chat)) {
++        if (Konsole::ViewSplitter *splitter = Konsole::ViewSplitter::parentSplitterForDisplay(display)) {
++            splitter->getToplevelSplitter()->clearMaximized();
++        }
++        display->setFocus(Qt::OtherFocusReason);
++    }
++    for (Member member : {Diff, Review}) {
++        if (Konsole::Session *session = _sessions[member]) {
++            disconnect(session, nullptr, this, nullptr);
++            session->closeInNormalWay();
++        }
++    }
++    Q_EMIT dissolved();
++}
++
++#include "moc_workgroup.cpp"
+diff --git a/src/plugins/ClaudeCode/workgroup.h b/src/plugins/ClaudeCode/workgroup.h
+new file mode 100644
+index 0000000..0214d90
+--- /dev/null
++++ b/src/plugins/ClaudeCode/workgroup.h
+@@ -0,0 +1,77 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#ifndef WORKGROUP_H
++#define WORKGROUP_H
++
++#include <QList>
++#include <QObject>
++#include <QPointer>
++#include <QString>
++
++#include <array>
++
++namespace Konsole
++{
++class Session;
++class TerminalDisplay;
++}
++class WorkgroupSwitcher;
++
++/**
++ * A Claude Code workgroup, after iTerm2's: the session running Claude Code
++ * (Chat) and two members beside it, Diff and Code Review. They share the
++ * Chat session's tab as splits, one maximized at a time; a switcher in each
++ * member's header bar, or a shortcut, shows another.
++ *
++ * The members start nothing on their own: Diff runs its diff the first time
++ * it is shown, and Code Review starts a review when asked.
++ */
++class Workgroup : public QObject
++{
++    Q_OBJECT
++
++public:
++    enum Member {
++        Chat,
++        Diff,
++        Review,
++    };
++    static constexpr int memberCount = 3;
++
++    /** The members' names, in switcher order. */
++    static QStringList memberNames();
++
++    /**
++     * Builds a workgroup around @p chat, whose tab gains the other members.
++     * @p toolsDirectory holds the member scripts and it2.
++     */
++    Workgroup(Konsole::Session *chat, const QString &toolsDirectory, QObject *parent = nullptr);
++    ~Workgroup() override;
++
++    Konsole::Session *session(Member member) const;
++    bool contains(Konsole::Session *session) const;
++    Member current() const;
++
++    /** Shows @p member in place of the others. */
++    void show(Member member);
++
++    /** Closes the Diff and Code Review members and shows Chat as it was. Emits dissolved(). */
++    void dissolve();
++
++Q_SIGNALS:
++    void dissolved();
++
++private:
++    Konsole::Session *createMember(Member member, const QString &toolsDirectory);
++    Konsole::TerminalDisplay *view(Member member) const;
++    void addSwitcher(Member member);
++
++    std::array<QPointer<Konsole::Session>, memberCount> _sessions;
++    QList<QPointer<WorkgroupSwitcher>> _switchers;
++    Member _current = Chat;
++    bool _diffStarted = false;
++    bool _dissolving = false;
++};
++
++#endif // WORKGROUP_H
+diff --git a/src/plugins/ClaudeCode/workgroup/claudecode-diff b/src/plugins/ClaudeCode/workgroup/claudecode-diff
+new file mode 100755
+index 0000000..26820a5
+--- /dev/null
++++ b/src/plugins/ClaudeCode/workgroup/claudecode-diff
+@@ -0,0 +1,43 @@
++#!/bin/bash
++# SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++# SPDX-License-Identifier: GPL-2.0-or-later
++#
++# The Diff member of a Claude Code workgroup in Konsole.
++#
++#   claudecode-diff [BASE]
++#
++# Waits for Enter, which the Claude Code plugin types the first time the
++# member is shown, then runs the diff against BASE (default HEAD) once git
++# reports staged or unstaged changes. Enter runs it again later. The command
++# is $CLAUDECODE_DIFF_COMMAND (default: git difftool -y -x vimdiff), with BASE
++# appended.
++
++base=${1:-HEAD}
++command=${CLAUDECODE_DIFF_COMMAND:-git difftool -y -x vimdiff}
++
++has_changes() {
++    # Staged or tracked unstaged changes; untracked files do not count.
++    ! git diff --quiet "$base" -- 2>/dev/null
++}
++
++clear
++printf 'Diff against %s\n\nThis session shows the working tree'"'"'s changes when you switch to it.\n' "$base"
++while read -r _; do
++    if ! git rev-parse --git-dir >/dev/null 2>&1; then
++        printf '\n%s is not in a git repository. Press Enter to check again.\n' "$PWD"
++        continue
++    fi
++    while ! has_changes; do
++        clear
++        printf 'Diff session is waiting for changes.\n\n'
++        printf 'This session only starts its command when git reports staged or unstaged\n'
++        printf 'changes against %s, and the working tree is clean. Edit a file (or stage\n' "$base"
++        printf 'one) and the command will start on its own. Press Enter to run it now anyway.\n'
++        if read -r -t 2 _; then
++            break
++        fi
++    done
++    clear
++    bash -c "$command \"\$1\"" claudecode-diff "$base"
++    printf '\nDiff finished. Press Enter to run it again.\n'
++done
+diff --git a/src/plugins/ClaudeCode/workgroup/claudecode-review b/src/plugins/ClaudeCode/workgroup/claudecode-review
+new file mode 100755
+index 0000000..c40d93c
+--- /dev/null
++++ b/src/plugins/ClaudeCode/workgroup/claudecode-review
+@@ -0,0 +1,56 @@
++#!/bin/bash
++# SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++# SPDX-License-Identifier: GPL-2.0-or-later
++#
++# The Code Review member of a Claude Code workgroup in Konsole.
++#
++# Starts nothing until asked: Enter starts a Claude Code review of the
++# pending changes with the review prompt, e edits the prompt first. The
++# prompt is kept in $XDG_CONFIG_HOME/konsole-claudecode/review-prompt.txt.
++# When code-review-system-prompt.txt and code-review-settings.json sit next to
++# this script, the review gets them too.
++
++here=$(dirname "$(readlink -f "$0")")
++prompt=${XDG_CONFIG_HOME:-$HOME/.config}/konsole-claudecode/review-prompt.txt
++if [ ! -f "$prompt" ]; then
++    mkdir -p "$(dirname "$prompt")"
++    cp "$here/review-prompt.txt" "$prompt"
++fi
++
++arguments=()
++[ -f "$here/code-review-system-prompt.txt" ] && arguments+=(--append-system-prompt-file "$here/code-review-system-prompt.txt")
++[ -f "$here/code-review-settings.json" ] && arguments+=(--settings "$here/code-review-settings.json")
++
++while :; do
++    width=$(tput cols)
++    clear
++    printf 'Code Review\n\nReview prompt (%s):\n\n' "$prompt"
++    sed 's/^/    /' "$prompt" | fold -s -w "$((width - 4))"
++    printf '\nEnter: start the review    e: edit the prompt\n'
++    # Wait for a key, redrawing if the view is resized meanwhile (it starts
++    # out narrow, before the workgroup shows it).
++    while :; do
++        read -r -s -n 1 -t 0.5 key
++        status=$?
++        if [ $status -le 128 ]; then
++            break
++        fi
++        [ "$(tput cols)" != "$width" ] && break
++    done
++    if [ $status -gt 128 ]; then
++        continue
++    elif [ $status -ne 0 ]; then
++        exit 0
++    fi
++    case "$key" in
++    e | E)
++        ${VISUAL:-${EDITOR:-vim}} "$prompt"
++        ;;
++    "")
++        clear
++        claude "$(cat "$prompt")" "${arguments[@]}"
++        printf '\nReview finished. Press Enter to continue.\n'
++        read -r _ || exit 0
++        ;;
++    esac
++done
+diff --git a/src/plugins/ClaudeCode/workgroup/review-prompt.txt b/src/plugins/ClaudeCode/workgroup/review-prompt.txt
+new file mode 100644
+index 0000000..9e747cd
+--- /dev/null
++++ b/src/plugins/ClaudeCode/workgroup/review-prompt.txt
+@@ -0,0 +1,11 @@
++Review the pending changes in this repo. Flag issues a careful maintainer would block on before merge, in roughly this order:
++  1. Correctness — logic errors, broken invariants, missed edge cases, off-by-one, races, lifetime/memory bugs, error paths that swallow failures.
++  2. Security — injection, authn/authz mistakes, secret handling, unsafe deserialization, unsafe defaults, TOCTOU.
++  3. Reliability & performance — blocking the wrong thread, unbounded resource use, accidental O(N²), retries without backoff, silent failure paths.
++  4. Contract risk — behavior changes callers rely on, silently changed defaults, broken backward compatibility, missing migrations.
++
++For each finding cite `file:line`, explain *why* it is wrong (not what the code does), and propose a concrete fix when one is obvious. Be calibrated: if a finding is not high-confidence, say so or skip it. Verify claims against the actual code rather than inferring from names.
++
++Skip pure style, formatting, naming, and anything a linter or CI already enforces.
++
++If you find nothing worth fixing, say so plainly.
+diff --git a/src/plugins/ClaudeCode/workgroupmanager.cpp b/src/plugins/ClaudeCode/workgroupmanager.cpp
+new file mode 100644
+index 0000000..bd1d070
+--- /dev/null
++++ b/src/plugins/ClaudeCode/workgroupmanager.cpp
+@@ -0,0 +1,139 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "workgroupmanager.h"
++#include "sessionstatusregistry.h"
++
++#include "ProgramStatus.h"
++#include "session/Session.h"
++
++#include <KConfigGroup>
++#include <KSharedConfig>
++
++#include <QCoreApplication>
++#include <QFileInfo>
++#include <QPointer>
++#include <QTimer>
++
++namespace
++{
++KConfigGroup settings()
++{
++    return KSharedConfig::openConfig()->group(QStringLiteral("ClaudeCode"));
++}
++
++// After Claude Code clears its status, how often and for how long to look for
++// its exit: it may still be running its SessionEnd hooks.
++constexpr int exitCheckIntervalMs = 250;
++constexpr int exitCheckAttempts = 40;
++}
++
++WorkgroupManager::WorkgroupManager(SessionStatusRegistry *registry, QObject *parent)
++    : QObject(parent)
++    , _autoEnter(settings().readEntry("AutoEnterWorkgroup", true))
++{
++    connect(registry, &SessionStatusRegistry::programStatusReported, this, &WorkgroupManager::programStatusReported);
++}
++
++QString WorkgroupManager::toolsDirectory()
++{
++    // A build tree keeps them next to Konsole; an installation, in libexec.
++    const QString beside = QCoreApplication::applicationDirPath() + QLatin1String("/claudecode");
++    if (QFileInfo::exists(beside + QLatin1String("/claudecode-diff"))) {
++        return beside;
++    }
++    return QStringLiteral(CLAUDECODE_TOOLS_DIRECTORY);
++}
++
++Workgroup *WorkgroupManager::workgroup(Konsole::Session *session) const
++{
++    for (Workgroup *workgroup : _workgroups) {
++        if (workgroup->contains(session)) {
++            return workgroup;
++        }
++    }
++    return nullptr;
++}
++
++void WorkgroupManager::enter(Konsole::Session *session)
++{
++    if (session == nullptr || workgroup(session) != nullptr || session->views().isEmpty()) {
++        return;
++    }
++    auto *workgroup = new Workgroup(session, toolsDirectory(), this);
++    _workgroups.append(workgroup);
++    connect(workgroup, &Workgroup::dissolved, this, [this, workgroup] {
++        _workgroups.removeOne(workgroup);
++        workgroup->deleteLater();
++    });
++}
++
++void WorkgroupManager::exit(Konsole::Session *session)
++{
++    if (Workgroup *workgroup = this->workgroup(session)) {
++        workgroup->dissolve();
++    }
++}
++
++bool WorkgroupManager::autoEnter() const
++{
++    return _autoEnter;
++}
++
++void WorkgroupManager::setAutoEnter(bool enabled)
++{
++    if (_autoEnter == enabled) {
++        return;
++    }
++    _autoEnter = enabled;
++    KConfigGroup group = settings();
++    group.writeEntry("AutoEnterWorkgroup", enabled);
++    group.sync();
++    Q_EMIT autoEnterChanged(enabled);
++}
++
++void WorkgroupManager::checkForExit(const QPointer<Konsole::Session> &session, int attemptsLeft)
++{
++    QTimer::singleShot(exitCheckIntervalMs, this, [this, session, attemptsLeft] {
++        if (session == nullptr || workgroup(session) == nullptr) {
++            return;
++        }
++        // Nothing but the shell left in the foreground: Claude Code is gone.
++        if (session->foregroundProcessId() == session->processId()) {
++            exit(session);
++        } else if (attemptsLeft > 1) {
++            checkForExit(session, attemptsLeft - 1);
++        }
++    });
++}
++
++void WorkgroupManager::programStatusReported(Konsole::Session *session, const Konsole::ProgramStatusReport &report)
++{
++    if (!report.id.isEmpty()) {
++        return;
++    }
++    QPointer<Konsole::Session> guarded(session);
++    Workgroup *current = workgroup(session);
++
++    if (report.state == Konsole::ProgramStatusReport::Clear) {
++        // Claude Code clears its records when it exits; a clear carries no
++        // app. Only the Chat member's Claude Code ends the workgroup, and only
++        // once nothing runs in the session's shell any more.
++        if (current == nullptr || current->session(Workgroup::Chat) != session) {
++            return;
++        }
++        checkForExit(guarded, exitCheckAttempts);
++        return;
++    }
++
++    if (_autoEnter && current == nullptr && report.app == QLatin1String("claude-code")) {
++        // Not from inside the terminal's escape sequence handling.
++        QTimer::singleShot(0, this, [this, guarded] {
++            if (guarded != nullptr) {
++                enter(guarded);
++            }
++        });
++    }
++}
++
++#include "moc_workgroupmanager.cpp"
+diff --git a/src/plugins/ClaudeCode/workgroupmanager.h b/src/plugins/ClaudeCode/workgroupmanager.h
+new file mode 100644
+index 0000000..c41b082
+--- /dev/null
++++ b/src/plugins/ClaudeCode/workgroupmanager.h
+@@ -0,0 +1,60 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#ifndef WORKGROUPMANAGER_H
++#define WORKGROUPMANAGER_H
++
++#include "workgroup.h"
++
++#include <QList>
++#include <QObject>
++#include <QPointer>
++
++namespace Konsole
++{
++class Session;
++struct ProgramStatusReport;
++}
++class SessionStatusRegistry;
++
++/**
++ * Starts and ends Claude Code workgroups. With automatic entry on (the
++ * default, kept in konsolerc as [ClaudeCode] AutoEnterWorkgroup), a session
++ * enters a workgroup when Claude Code starts in it, which Claude Code's first
++ * program status report (OSC 7501, app=claude-code) shows, and leaves it when
++ * Claude Code exits there.
++ */
++class WorkgroupManager : public QObject
++{
++    Q_OBJECT
++
++public:
++    explicit WorkgroupManager(SessionStatusRegistry *registry, QObject *parent = nullptr);
++
++    /** The workgroup @p session belongs to, or nullptr. */
++    Workgroup *workgroup(Konsole::Session *session) const;
++
++    /** Makes @p session the Chat member of a new workgroup. */
++    void enter(Konsole::Session *session);
++
++    /** Ends the workgroup @p session belongs to. */
++    void exit(Konsole::Session *session);
++
++    bool autoEnter() const;
++    void setAutoEnter(bool enabled);
++
++    /** The directory holding the member scripts and it2. */
++    static QString toolsDirectory();
++
++Q_SIGNALS:
++    void autoEnterChanged(bool enabled);
++
++private:
++    void programStatusReported(Konsole::Session *session, const Konsole::ProgramStatusReport &report);
++    void checkForExit(const QPointer<Konsole::Session> &session, int attemptsLeft);
++
++    QList<Workgroup *> _workgroups;
++    bool _autoEnter;
++};
++
++#endif // WORKGROUPMANAGER_H
+diff --git a/src/plugins/ClaudeCode/workgroupswitcher.cpp b/src/plugins/ClaudeCode/workgroupswitcher.cpp
+new file mode 100644
+index 0000000..7871437
+--- /dev/null
++++ b/src/plugins/ClaudeCode/workgroupswitcher.cpp
+@@ -0,0 +1,37 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "workgroupswitcher.h"
++
++#include <QButtonGroup>
++#include <QHBoxLayout>
++#include <QToolButton>
++
++WorkgroupSwitcher::WorkgroupSwitcher(const QStringList &members, QWidget *parent)
++    : QWidget(parent)
++    , _buttons(new QButtonGroup(this))
++{
++    auto *layout = new QHBoxLayout(this);
++    layout->setContentsMargins(4, 0, 4, 0);
++    layout->setSpacing(0);
++    for (int i = 0; i < members.size(); i++) {
++        auto *button = new QToolButton(this);
++        button->setText(members.at(i));
++        button->setCheckable(true);
++        button->setAutoRaise(true);
++        button->setToolButtonStyle(Qt::ToolButtonTextOnly);
++        _buttons->addButton(button, i);
++        layout->addWidget(button);
++    }
++    _buttons->setExclusive(true);
++    connect(_buttons, &QButtonGroup::idClicked, this, &WorkgroupSwitcher::memberChosen);
++}
++
++void WorkgroupSwitcher::setCurrent(int member)
++{
++    if (QAbstractButton *button = _buttons->button(member)) {
++        button->setChecked(true);
++    }
++}
++
++#include "moc_workgroupswitcher.cpp"
+diff --git a/src/plugins/ClaudeCode/workgroupswitcher.h b/src/plugins/ClaudeCode/workgroupswitcher.h
+new file mode 100644
+index 0000000..3e81c88
+--- /dev/null
++++ b/src/plugins/ClaudeCode/workgroupswitcher.h
+@@ -0,0 +1,33 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#ifndef WORKGROUPSWITCHER_H
++#define WORKGROUPSWITCHER_H
++
++#include <QWidget>
++
++class QButtonGroup;
++
++/**
++ * A segmented control naming a workgroup's members (Chat, Diff, Code
++ * Review), shown in the header bar of each member's view. Choosing one
++ * switches the workgroup to it.
++ */
++class WorkgroupSwitcher : public QWidget
++{
++    Q_OBJECT
++
++public:
++    explicit WorkgroupSwitcher(const QStringList &members, QWidget *parent = nullptr);
++
++    /** Marks @p member as the one showing, without emitting memberChosen. */
++    void setCurrent(int member);
++
++Q_SIGNALS:
++    void memberChosen(int member);
++
++private:
++    QButtonGroup *_buttons;
++};
++
++#endif // WORKGROUPSWITCHER_H
+-- 
+2.56.0
+

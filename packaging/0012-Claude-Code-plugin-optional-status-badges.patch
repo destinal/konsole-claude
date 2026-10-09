@@ -1,0 +1,258 @@
+From 2d59473f3905829678b32a9e766aed8e570d663a Mon Sep 17 00:00:00 2001
+From: Eric Duprey <509630+destinal@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 14:13:27 -0700
+Subject: [PATCH 12/17] Claude Code plugin: optional status badges
+
+Plugins > Show Status Badges shows each session's status as its badge,
+the label drawn in the terminal's top-right corner, on the status color.
+It is off by default and kept in konsolerc ([ClaudeCode]
+ShowStatusBadges). While a status badge shows, the session's own badge
+(enabled, text, color, text-only) is put aside, and it comes back as it
+was when the status clears or badges are turned off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/plugins/ClaudeCode/CMakeLists.txt       |   2 +
+ src/plugins/ClaudeCode/claudecodeplugin.cpp |  13 ++-
+ src/plugins/ClaudeCode/statusbadges.cpp     | 100 ++++++++++++++++++++
+ src/plugins/ClaudeCode/statusbadges.h       |  56 +++++++++++
+ 4 files changed, 170 insertions(+), 1 deletion(-)
+ create mode 100644 src/plugins/ClaudeCode/statusbadges.cpp
+ create mode 100644 src/plugins/ClaudeCode/statusbadges.h
+
+diff --git a/src/plugins/ClaudeCode/CMakeLists.txt b/src/plugins/ClaudeCode/CMakeLists.txt
+index 2eeb4cb..c4ca54c 100644
+--- a/src/plugins/ClaudeCode/CMakeLists.txt
++++ b/src/plugins/ClaudeCode/CMakeLists.txt
+@@ -9,6 +9,7 @@ SOURCES
+     programstatusrecords.cpp
+     sessionstatus.cpp
+     sessionstatusregistry.cpp
++    statusbadges.cpp
+ INSTALL_NAMESPACE
+     "konsoleplugins"
+ )
+@@ -18,6 +19,7 @@ target_link_libraries(konsole_claudecodeplugin
+     konsoleprivate
+     konsoleapp
+     Qt::DBus
++    KF6::ConfigCore
+     KF6::I18n
+     KF6::Notifications
+     KF6::WindowSystem
+diff --git a/src/plugins/ClaudeCode/claudecodeplugin.cpp b/src/plugins/ClaudeCode/claudecodeplugin.cpp
+index 1a9b79a..125e161 100644
+--- a/src/plugins/ClaudeCode/claudecodeplugin.cpp
++++ b/src/plugins/ClaudeCode/claudecodeplugin.cpp
+@@ -9,6 +9,7 @@
+ #include "programstatusrecords.h"
+ #include "sessionstatus.h"
+ #include "sessionstatusregistry.h"
++#include "statusbadges.h"
+ #include "statusnotifier.h"
+ 
+ #include "MainWindow.h"
+@@ -27,6 +28,7 @@ K_PLUGIN_CLASS_WITH_JSON(ClaudeCodePlugin, "konsole_claudecode.json")
+ struct ClaudeCodePlugin::Private {
+     SessionStatusRegistry *registry = nullptr;
+     ClaudeSessionsModel *model = nullptr;
++    StatusBadges *badges = nullptr;
+     QMap<Konsole::MainWindow *, QDockWidget *> dockForWindow;
+ };
+ 
+@@ -39,6 +41,7 @@ ClaudeCodePlugin::ClaudeCodePlugin(QObject *object, const QVariantList &args)
+     priv->registry = new SessionStatusRegistry(this);
+     priv->model = new ClaudeSessionsModel(priv->registry, this);
+     new StatusNotifier(priv->registry, this);
++    priv->badges = new StatusBadges(priv->registry, this);
+ 
+     // The session's tab shows its status as a colored dot.
+     connect(priv->registry, &SessionStatusRegistry::statusChanged, this, [this](Konsole::Session *session) {
+@@ -110,7 +113,15 @@ QList<QAction *> ClaudeCodePlugin::menuBarActions(Konsole::MainWindow *mainWindo
+     mainWindow->actionCollection()->addAction(QStringLiteral("claudecode-show-sessions"), toggleVisibilityAction);
+     mainWindow->actionCollection()->setDefaultShortcut(toggleVisibilityAction, QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_F3));
+ 
+-    return {toggleVisibilityAction};
++    auto *badgesAction = new QAction(i18n("Show Status Badges"), mainWindow);
++    badgesAction->setCheckable(true);
++    badgesAction->setChecked(priv->badges->isEnabled());
++    mainWindow->actionCollection()->addAction(QStringLiteral("claudecode-show-badges"), badgesAction);
++    connect(badgesAction, &QAction::toggled, priv->badges, &StatusBadges::setEnabled);
++    // One setting for every window: keep each window's menu in step.
++    connect(priv->badges, &StatusBadges::enabledChanged, badgesAction, &QAction::setChecked);
++
++    return {toggleVisibilityAction, badgesAction};
+ }
+ 
+ #include "claudecodeplugin.moc"
+diff --git a/src/plugins/ClaudeCode/statusbadges.cpp b/src/plugins/ClaudeCode/statusbadges.cpp
+new file mode 100644
+index 0000000..c5670df
+--- /dev/null
++++ b/src/plugins/ClaudeCode/statusbadges.cpp
+@@ -0,0 +1,100 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "statusbadges.h"
++#include "sessionstatus.h"
++#include "sessionstatusregistry.h"
++
++#include "session/Session.h"
++
++#include <KConfigGroup>
++#include <KSharedConfig>
++
++namespace
++{
++KConfigGroup settings()
++{
++    return KSharedConfig::openConfig()->group(QStringLiteral("ClaudeCode"));
++}
++}
++
++StatusBadges::StatusBadges(SessionStatusRegistry *registry, QObject *parent)
++    : QObject(parent)
++    , _registry(registry)
++    , _enabled(settings().readEntry("ShowStatusBadges", false))
++{
++    connect(_registry, &SessionStatusRegistry::statusChanged, this, &StatusBadges::update);
++    const auto sessions = _registry->sessions();
++    for (Konsole::Session *session : sessions) {
++        update(session);
++    }
++}
++
++bool StatusBadges::isEnabled() const
++{
++    return _enabled;
++}
++
++void StatusBadges::setEnabled(bool enabled)
++{
++    if (_enabled == enabled) {
++        return;
++    }
++    _enabled = enabled;
++    KConfigGroup group = settings();
++    group.writeEntry("ShowStatusBadges", enabled);
++    group.sync();
++
++    const auto sessions = _registry->sessions();
++    for (Konsole::Session *session : sessions) {
++        update(session);
++    }
++    Q_EMIT enabledChanged(enabled);
++}
++
++void StatusBadges::update(Konsole::Session *session)
++{
++    SessionStatus *status = _registry->status(session);
++    const bool show = _enabled && status != nullptr && status->statusText().has_value();
++    const bool shown = _saved.contains(session);
++
++    if (!show) {
++        if (shown) {
++            setBadge(session, _saved.take(session));
++        }
++        return;
++    }
++
++    if (!shown) {
++        _saved.insert(session, badgeOf(session));
++        connect(
++            session,
++            &QObject::destroyed,
++            this,
++            [this, session] {
++                _saved.remove(session);
++            },
++            Qt::UniqueConnection);
++    }
++    Badge badge;
++    badge.enabled = true;
++    badge.text = *status->statusText();
++    badge.color = status->indicator().isValid() ? status->indicator() : status->statusColor();
++    badge.textOnly = false;
++    setBadge(session, badge);
++}
++
++StatusBadges::Badge StatusBadges::badgeOf(Konsole::Session *session)
++{
++    return {session->badgeEnabled(), session->badgeText(), session->badgeColor(), session->badgeTextOnly()};
++}
++
++void StatusBadges::setBadge(Konsole::Session *session, const Badge &badge)
++{
++    session->setBadgeText(badge.text);
++    session->setBadgeColor(badge.color);
++    session->setBadgeTextOnly(badge.textOnly);
++    session->setBadgeEnabled(badge.enabled);
++}
++
++#include "moc_statusbadges.cpp"
+diff --git a/src/plugins/ClaudeCode/statusbadges.h b/src/plugins/ClaudeCode/statusbadges.h
+new file mode 100644
+index 0000000..b81e8ab
+--- /dev/null
++++ b/src/plugins/ClaudeCode/statusbadges.h
+@@ -0,0 +1,56 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#ifndef STATUSBADGES_H
++#define STATUSBADGES_H
++
++#include <QColor>
++#include <QHash>
++#include <QObject>
++#include <QString>
++
++namespace Konsole
++{
++class Session;
++}
++class SessionStatusRegistry;
++
++/**
++ * Optionally shows each session's status as its badge, the label Konsole
++ * draws in the terminal's top-right corner. Off by default; the setting is
++ * kept in konsolerc. While a status badge shows, the session's own badge
++ * settings are put aside and come back as they were when the status goes or
++ * badges are turned off.
++ */
++class StatusBadges : public QObject
++{
++    Q_OBJECT
++
++public:
++    explicit StatusBadges(SessionStatusRegistry *registry, QObject *parent = nullptr);
++
++    bool isEnabled() const;
++    void setEnabled(bool enabled);
++
++Q_SIGNALS:
++    void enabledChanged(bool enabled);
++
++private:
++    struct Badge {
++        bool enabled = false;
++        QString text;
++        QColor color;
++        bool textOnly = false;
++    };
++
++    void update(Konsole::Session *session);
++    static Badge badgeOf(Konsole::Session *session);
++    static void setBadge(Konsole::Session *session, const Badge &badge);
++
++    SessionStatusRegistry *_registry;
++    bool _enabled;
++    // The badge each session had before a status badge replaced it.
++    QHash<Konsole::Session *, Badge> _saved;
++};
++
++#endif // STATUSBADGES_H
+-- 
+2.56.0
+

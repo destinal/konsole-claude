@@ -1,0 +1,45 @@
+From 94b6a374506a1de1f6dc64a781f7254aa620efe8 Mon Sep 17 00:00:00 2001
+From: Eric Duprey <509630+destinal@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 13:20:19 -0700
+Subject: [PATCH 05/17] Add SessionManager::sessionCreated
+
+Plugins that track every session need to know when one is created, not
+only when its view becomes active. A session restored into a background
+tab may never become active before it starts producing output.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/session/SessionManager.cpp | 2 ++
+ src/session/SessionManager.h   | 3 +++
+ 2 files changed, 5 insertions(+)
+
+diff --git a/src/session/SessionManager.cpp b/src/session/SessionManager.cpp
+index e122f92..868a5b7 100644
+--- a/src/session/SessionManager.cpp
++++ b/src/session/SessionManager.cpp
+@@ -108,6 +108,8 @@ Session *SessionManager::createSession(Profile::Ptr profile)
+     _sessions << session;
+     _sessionProfiles.insert(session, profile);
+ 
++    Q_EMIT sessionCreated(session);
++
+     return session;
+ }
+ 
+diff --git a/src/session/SessionManager.h b/src/session/SessionManager.h
+index a785471..8072072 100644
+--- a/src/session/SessionManager.h
++++ b/src/session/SessionManager.h
+@@ -90,6 +90,9 @@ Q_SIGNALS:
+      */
+     void sessionUpdated(Session *session);
+ 
++    /** Emitted after createSession() creates @p session. */
++    void sessionCreated(Session *session);
++
+ protected Q_SLOTS:
+     /**
+      * Called to inform the manager that a session has finished executing.
+-- 
+2.56.0
+

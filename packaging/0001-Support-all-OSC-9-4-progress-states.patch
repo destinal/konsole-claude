@@ -1,0 +1,544 @@
+From 891f931ec446a719b89d3f89cf0e1de01ee3f39d Mon Sep 17 00:00:00 2001
+From: Eric Duprey <509630+destinal@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 12:51:04 -0700
+Subject: [PATCH 01/17] Support all OSC 9;4 progress states
+
+Konsole treated the indeterminate state (OSC 9;4;3) the same as hiding
+progress and ignored the error and paused states. Programs such as
+Claude Code report a running turn as indeterminate progress, so the start
+of a turn looked the same as its end.
+
+Progress now carries a state: normal, error, indeterminate or paused.
+Tabs draw error in the negative color, paused in the neutral color, and
+indeterminate as a segment sliding across the bar. The error and paused
+states keep the last percentage when they omit one. The taskbar entry
+has no indeterminate state, so it stays hidden for that case as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/Emulation.h                      | 14 +++-----
+ src/MainWindow.cpp                   |  7 ++--
+ src/MainWindow.h                     |  3 +-
+ src/TerminalProgress.h               | 38 +++++++++++++++++++++
+ src/ViewProperties.cpp               |  4 +--
+ src/ViewProperties.h                 |  7 ++--
+ src/Vt102Emulation.cpp               | 29 ++++++++++------
+ src/Vt102Emulation.h                 |  4 +++
+ src/autotests/Vt102EmulationTest.cpp | 34 +++++++++++++++++++
+ src/autotests/Vt102EmulationTest.h   |  2 ++
+ src/session/SessionController.cpp    |  5 +--
+ src/widgets/DetachableTabBar.cpp     | 50 +++++++++++++++++++++++++---
+ src/widgets/DetachableTabBar.h       | 11 ++++--
+ src/widgets/ViewContainer.h          |  3 +-
+ 14 files changed, 172 insertions(+), 39 deletions(-)
+ create mode 100644 src/TerminalProgress.h
+
+diff --git a/src/Emulation.h b/src/Emulation.h
+index 99230de..42cd770 100644
+--- a/src/Emulation.h
++++ b/src/Emulation.h
+@@ -16,10 +16,12 @@
+ 
+ // Konsole
+ #include "Enumeration.h"
++#include "TerminalProgress.h"
+ #include "konsoleprivate_export.h"
+ #include "terminalDisplay/TerminalDisplay.h"
+ 
+ #include <memory>
++#include <optional>
+ 
+ class QKeyEvent;
+ 
+@@ -452,17 +454,11 @@ Q_SIGNALS:
+ 
+     /**
+      * Emitted after receiving the escape sequence which asks to
+-     * display progress.
++     * display or hide progress.
+      *
+-     * @param progress The progress in percent (0-100)
++     * @param progress The progress to display, or std::nullopt to hide it
+      */
+-    void progressChanged(int progress);
+-
+-    /**
+-     * Emitted after receiving the escape sequence which asks to
+-     * hide progress.
+-     */
+-    void progressHidden();
++    void progressChanged(const std::optional<Konsole::TerminalProgress> &progress);
+ 
+ protected:
+     virtual void setMode(int mode) = 0;
+diff --git a/src/MainWindow.cpp b/src/MainWindow.cpp
+index 10cff02..11e614a 100644
+--- a/src/MainWindow.cpp
++++ b/src/MainWindow.cpp
+@@ -391,7 +391,7 @@ void MainWindow::updateWindowIcon()
+ void MainWindow::updateProgress()
+ {
+ #if HAVE_DBUS
+-    std::optional<int> progress;
++    std::optional<TerminalProgress> progress;
+     if (KonsoleSettings::showProgressInTaskBar() && _pluggedController) {
+         progress = _pluggedController->progress();
+     }
+@@ -410,8 +410,9 @@ void MainWindow::updateProgress()
+     }
+ 
+     QVariantMap properties;
+-    if (progress.has_value()) {
+-        properties.insert(QStringLiteral("progress"), progress.value() / 100.0);
++    // The launcher entry API has no indeterminate state.
++    if (progress.has_value() && progress->state != TerminalProgress::Indeterminate) {
++        properties.insert(QStringLiteral("progress"), progress->percent / 100.0);
+         properties.insert(QStringLiteral("progress-visible"), true);
+     } else {
+         properties.insert(QStringLiteral("progress-visible"), false);
+diff --git a/src/MainWindow.h b/src/MainWindow.h
+index 6ee789b..0142112 100644
+--- a/src/MainWindow.h
++++ b/src/MainWindow.h
+@@ -20,6 +20,7 @@
+ #include <KXmlGuiWindow>
+ 
+ // Konsole
++#include "TerminalProgress.h"
+ #include "konsoleapp_export.h"
+ 
+ #include <optional>
+@@ -244,7 +245,7 @@ private:
+     QPointer<SessionController> _pluggedController;
+     std::vector<IKonsolePlugin *> _plugins;
+     QList<QAction *> _pluginsActions;
+-    std::optional<int> _progress;
++    std::optional<TerminalProgress> _progress;
+     bool _blurEnabled = false;
+     bool _firstShowEvent = true;
+ 
+diff --git a/src/TerminalProgress.h b/src/TerminalProgress.h
+new file mode 100644
+index 0000000..f612055
+--- /dev/null
++++ b/src/TerminalProgress.h
+@@ -0,0 +1,38 @@
++/*
++    SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#ifndef TERMINALPROGRESS_H
++#define TERMINALPROGRESS_H
++
++namespace Konsole
++{
++/**
++ * Progress reported by a program with the OSC 9;4 escape sequence.
++ */
++struct TerminalProgress {
++    enum State {
++        Normal,
++        Error,
++        Indeterminate,
++        Paused,
++    };
++
++    State state = Normal;
++    /** Percent complete, 0-100. Not used by the Indeterminate state. */
++    int percent = 0;
++
++    bool operator==(const TerminalProgress &other) const
++    {
++        return state == other.state && percent == other.percent;
++    }
++    bool operator!=(const TerminalProgress &other) const
++    {
++        return !(*this == other);
++    }
++};
++}
++
++#endif
+diff --git a/src/ViewProperties.cpp b/src/ViewProperties.cpp
+index a31c8f1..ca28761 100644
+--- a/src/ViewProperties.cpp
++++ b/src/ViewProperties.cpp
+@@ -94,7 +94,7 @@ void ViewProperties::setIdentifier(int id)
+     _viewProperties.insert(id, this);
+ }
+ 
+-void ViewProperties::setProgress(const std::optional<int> &progress)
++void ViewProperties::setProgress(const std::optional<TerminalProgress> &progress)
+ {
+     if (_progress != progress) {
+         _progress = progress;
+@@ -122,7 +122,7 @@ QColor ViewProperties::color() const
+     return _color;
+ }
+ 
+-std::optional<int> ViewProperties::progress() const
++std::optional<Konsole::TerminalProgress> ViewProperties::progress() const
+ {
+     return _progress;
+ }
+diff --git a/src/ViewProperties.h b/src/ViewProperties.h
+index c551ca7..957115d 100644
+--- a/src/ViewProperties.h
++++ b/src/ViewProperties.h
+@@ -18,6 +18,7 @@
+ #include <optional>
+ 
+ // Konsole
++#include "TerminalProgress.h"
+ #include "konsoleprivate_export.h"
+ #include "session/Session.h"
+ 
+@@ -45,7 +46,7 @@ public:
+     /** Returns the color associated with a view */
+     QColor color() const;
+     /** Returns the progress associated with a view */
+-    std::optional<int> progress() const;
++    std::optional<TerminalProgress> progress() const;
+     /** Returns the activity color associated with a view */
+     QColor activityColor() const;
+ 
+@@ -136,7 +137,7 @@ protected:
+     /** Subclasses may call this method to change the identifier. */
+     void setIdentifier(int id);
+     /** Subclass may call this method to change the progress. */
+-    void setProgress(const std::optional<int> &progress);
++    void setProgress(const std::optional<TerminalProgress> &progress);
+ 
+ private:
+     Q_DISABLE_COPY(ViewProperties)
+@@ -146,7 +147,7 @@ private:
+     QColor _color;
+     QColor _activityColor;
+     int _identifier;
+-    std::optional<int> _progress;
++    std::optional<TerminalProgress> _progress;
+     static QHash<int, ViewProperties *> _viewProperties;
+ };
+ }
+diff --git a/src/Vt102Emulation.cpp b/src/Vt102Emulation.cpp
+index 1cc2c1e..614bd8d 100644
+--- a/src/Vt102Emulation.cpp
++++ b/src/Vt102Emulation.cpp
+@@ -1866,27 +1866,36 @@ void Vt102Emulation::processSessionAttributeRequest(const int tokenSize, const u
+                 bool ok;
+                 const int st = list.at(1).toInt(&ok);
+                 if (ok) {
++                    std::optional<int> percent;
++                    if (list.size() >= 3) {
++                        const int pr = list.at(2).toInt(&ok);
++                        if (ok && pr >= 0 && pr <= 100) {
++                            percent = pr;
++                        }
++                    }
+                     switch (st) {
+                     case 0:
+-                        Q_EMIT progressHidden();
++                        _progressPercent = 0;
++                        Q_EMIT progressChanged(std::nullopt);
+                         break;
+                     case 1:
+-                        if (list.size() >= 3) {
+-                            const int pr = list.at(2).toInt(&ok);
+-                            if (ok && pr >= 0 && pr <= 100) {
+-                                Q_EMIT progressChanged(pr);
+-                            }
++                        if (percent.has_value()) {
++                            _progressPercent = percent.value();
++                            Q_EMIT progressChanged(TerminalProgress{TerminalProgress::Normal, _progressPercent});
+                         }
+                         break;
+                     case 2:
+-                        // TODO error state.
++                        // The percentage is optional for the error and paused
++                        // states; without one, the last reported value stays.
++                        _progressPercent = percent.value_or(_progressPercent);
++                        Q_EMIT progressChanged(TerminalProgress{TerminalProgress::Error, _progressPercent});
+                         break;
+                     case 3:
+-                        // TODO indeterminate state.
+-                        Q_EMIT progressHidden();
++                        Q_EMIT progressChanged(TerminalProgress{TerminalProgress::Indeterminate, 0});
+                         break;
+                     case 4:
+-                        // TODO paused state.
++                        _progressPercent = percent.value_or(_progressPercent);
++                        Q_EMIT progressChanged(TerminalProgress{TerminalProgress::Paused, _progressPercent});
+                         break;
+                     }
+                 }
+diff --git a/src/Vt102Emulation.h b/src/Vt102Emulation.h
+index 9f99d5e..b49cc11 100644
+--- a/src/Vt102Emulation.h
++++ b/src/Vt102Emulation.h
+@@ -328,6 +328,10 @@ private:
+     qint64 _kittyNotificationSerial = 0;
+     QMap<QString, KittyNotificationState> _kittyNotifications;
+ 
++    // Last percentage reported with OSC 9;4, kept for the error and paused
++    // states, which may omit it.
++    int _progressPercent = 0;
++
+     TerminalState _currentModes;
+     TerminalState _savedModes;
+ 
+diff --git a/src/autotests/Vt102EmulationTest.cpp b/src/autotests/Vt102EmulationTest.cpp
+index 1baac17..80a1a0a 100644
+--- a/src/autotests/Vt102EmulationTest.cpp
++++ b/src/autotests/Vt102EmulationTest.cpp
+@@ -765,6 +765,40 @@ void Vt102EmulationTest::testKittyKeyboardTextKeys()
+     }
+ }
+ 
++void Vt102EmulationTest::testProgressStates()
++{
++    TestEmulation em;
++    em.reset();
++    em.setCodec(TestEmulation::Utf8Codec);
++
++    std::vector<std::optional<TerminalProgress>> reports;
++    connect(&em, &Emulation::progressChanged, this, [&reports](const std::optional<TerminalProgress> &progress) {
++        reports.push_back(progress);
++    });
++    auto send = [&em](const char *sequence) {
++        em.receiveData(sequence, strlen(sequence));
++    };
++
++    send("\033]9;4;3\007");
++    send("\033]9;4;1;40\007");
++    // Error and paused keep the last percentage when they omit one.
++    send("\033]9;4;2\007");
++    send("\033]9;4;4;70\007");
++    send("\033]9;4;0\007");
++    // Normal progress needs a percentage in range; these are ignored.
++    send("\033]9;4;1\007");
++    send("\033]9;4;1;150\007");
++
++    const std::vector<std::optional<TerminalProgress>> expected = {
++        TerminalProgress{TerminalProgress::Indeterminate, 0},
++        TerminalProgress{TerminalProgress::Normal, 40},
++        TerminalProgress{TerminalProgress::Error, 40},
++        TerminalProgress{TerminalProgress::Paused, 70},
++        std::nullopt,
++    };
++    QCOMPARE(reports, expected);
++}
++
+ QTEST_GUILESS_MAIN(Vt102EmulationTest)
+ 
+ #include "moc_Vt102EmulationTest.cpp"
+diff --git a/src/autotests/Vt102EmulationTest.h b/src/autotests/Vt102EmulationTest.h
+index df9cc6e..1096fe1 100644
+--- a/src/autotests/Vt102EmulationTest.h
++++ b/src/autotests/Vt102EmulationTest.h
+@@ -44,6 +44,8 @@ private Q_SLOTS:
+     void testKittyKeyboardCtrlLetters();
+     void testKittyKeyboardTextKeys();
+ 
++    void testProgressStates();
++
+ private:
+     static void sendAndCompare(TestEmulation *em, const char *input, size_t inputLen, const QString &expectedPrint, const QByteArray &expectedSent);
+ };
+diff --git a/src/session/SessionController.cpp b/src/session/SessionController.cpp
+index 3668807..157d6b0 100644
+--- a/src/session/SessionController.cpp
++++ b/src/session/SessionController.cpp
+@@ -232,12 +232,9 @@ SessionController::SessionController(Session *sessionParam, TerminalDisplay *vie
+     // xterm '11;?' request
+     connect(session(), &Konsole::Session::getBackgroundColor, this, &Konsole::SessionController::sendBackgroundColor);
+ 
+-    connect(session()->emulation(), &Konsole::Emulation::progressChanged, this, [this](int progress) {
++    connect(session()->emulation(), &Konsole::Emulation::progressChanged, this, [this](const std::optional<TerminalProgress> &progress) {
+         setProgress(progress);
+     });
+-    connect(session()->emulation(), &Konsole::Emulation::progressHidden, this, [this] {
+-        setProgress(std::nullopt);
+-    });
+ 
+     _allControllers.insert(this);
+ 
+diff --git a/src/widgets/DetachableTabBar.cpp b/src/widgets/DetachableTabBar.cpp
+index b51f2c9..59dc65f 100644
+--- a/src/widgets/DetachableTabBar.cpp
++++ b/src/widgets/DetachableTabBar.cpp
+@@ -13,9 +13,11 @@
+ #include <QMouseEvent>
+ 
+ #include <KAcceleratorManager>
++#include <KColorScheme>
+ 
+ #include <QColor>
+ #include <QPainter>
++#include <QTimer>
+ 
+ namespace Konsole
+ {
+@@ -25,10 +27,21 @@ DetachableTabBar::DetachableTabBar(QWidget *parent)
+     , _originalCursor(cursor())
+     , tabId(-1)
+     , _activityColor(QColor::Invalid)
++    , _indeterminateTimer(new QTimer(this))
+ {
+     setAcceptDrops(true);
+     setElideMode(Qt::TextElideMode::ElideLeft);
+     KAcceleratorManager::setNoAccel(this);
++
++    _indeterminateTimer->setInterval(50);
++    connect(_indeterminateTimer, &QTimer::timeout, this, [this] {
++        if (!hasIndeterminateProgress()) {
++            _indeterminateTimer->stop();
++            return;
++        }
++        _indeterminatePhase = (_indeterminatePhase + 2) % 100;
++        update();
++    });
+ }
+ 
+ void DetachableTabBar::setColor(int idx, const QColor &color)
+@@ -58,7 +71,7 @@ void DetachableTabBar::removeColor(int idx)
+     }
+ }
+ 
+-void DetachableTabBar::setProgress(int idx, const std::optional<int> &progress)
++void DetachableTabBar::setProgress(int idx, const std::optional<TerminalProgress> &progress)
+ {
+     DetachableTabData data = tabData(idx).value<DetachableTabData>();
+     if (data.progress != progress) {
+@@ -66,6 +79,21 @@ void DetachableTabBar::setProgress(int idx, const std::optional<int> &progress)
+         setDetachableTabData(idx, data);
+         update(tabRect(idx));
+     }
++
++    if (progress.has_value() && progress->state == TerminalProgress::Indeterminate && !_indeterminateTimer->isActive()) {
++        _indeterminateTimer->start();
++    }
++}
++
++bool DetachableTabBar::hasIndeterminateProgress() const
++{
++    for (int tabIndex = 0; tabIndex < count(); tabIndex++) {
++        const auto progress = tabData(tabIndex).value<DetachableTabData>().progress;
++        if (progress.has_value() && progress->state == TerminalProgress::Indeterminate) {
++            return true;
++        }
++    }
++    return false;
+ }
+ 
+ void DetachableTabBar::setDetachableTabData(int idx, const DetachableTabData &data)
+@@ -206,7 +234,11 @@ void DetachableTabBar::paintEvent(QPaintEvent *event)
+             continue;
+         }
+ 
+-        const QColor color = colorValid ? tabData.color : palette().highlight().color();
++        QColor color = colorValid ? tabData.color : palette().highlight().color();
++        if (tabData.progress.has_value() && tabData.progress->state != TerminalProgress::Normal && tabData.progress->state != TerminalProgress::Indeterminate) {
++            const KColorScheme colorScheme(palette().currentColorGroup());
++            color = colorScheme.foreground(tabData.progress->state == TerminalProgress::Error ? KColorScheme::NegativeText : KColorScheme::NeutralText).color();
++        }
+ 
+         painter.setBrush(color);
+         QRect tRect = tabRect(tabIndex);
+@@ -221,8 +253,18 @@ void DetachableTabBar::paintEvent(QPaintEvent *event)
+             painter.drawRect(tRect);
+             painter.setOpacity(1.0);
+ 
+-            tRect.setWidth(tRect.width() * tabData.progress.value() / 100.0);
+-            painter.drawRect(tRect);
++            if (tabData.progress->state == TerminalProgress::Indeterminate) {
++                // A quarter-width segment that slides across the bar and wraps.
++                const int segmentWidth = tRect.width() / 4;
++                const int x = tRect.left() + (tRect.width() + segmentWidth) * _indeterminatePhase / 100 - segmentWidth;
++                painter.save();
++                painter.setClipRect(tRect);
++                painter.drawRect(QRect(x, tRect.top(), segmentWidth, tRect.height()));
++                painter.restore();
++            } else {
++                tRect.setWidth(tRect.width() * tabData.progress->percent / 100.0);
++                painter.drawRect(tRect);
++            }
+         } else {
+             painter.drawRect(tRect);
+         }
+diff --git a/src/widgets/DetachableTabBar.h b/src/widgets/DetachableTabBar.h
+index d1d3bc5..5e84b63 100644
+--- a/src/widgets/DetachableTabBar.h
++++ b/src/widgets/DetachableTabBar.h
+@@ -12,8 +12,11 @@
+ 
+ #include <optional>
+ 
++#include "TerminalProgress.h"
++
+ class QColor;
+ class QPaintEvent;
++class QTimer;
+ 
+ namespace Konsole
+ {
+@@ -21,7 +24,7 @@ class TabbedViewContainer;
+ 
+ struct DetachableTabData {
+     QColor color;
+-    std::optional<int> progress;
++    std::optional<TerminalProgress> progress;
+ };
+ 
+ class DetachableTabBar : public QTabBar
+@@ -40,7 +43,7 @@ public:
+     void removeColor(int idx);
+     void setActivityColor(int idx, const QColor &color);
+ 
+-    void setProgress(int idx, const std::optional<int> &progress);
++    void setProgress(int idx, const std::optional<TerminalProgress> &progress);
+ 
+ Q_SIGNALS:
+     void detachTab(int index);
+@@ -59,12 +62,16 @@ protected:
+ 
+ private:
+     void setDetachableTabData(int idx, const DetachableTabData &data);
++    bool hasIndeterminateProgress() const;
+ 
+     DragType dragType;
+     QCursor _originalCursor;
+     QList<TabbedViewContainer *> _containers;
+     int tabId;
+     QColor _activityColor;
++    // Drives the animation of indeterminate progress bars.
++    QTimer *_indeterminateTimer;
++    int _indeterminatePhase = 0;
+ };
+ }
+ 
+diff --git a/src/widgets/ViewContainer.h b/src/widgets/ViewContainer.h
+index db3c1ed..4116e49 100644
+--- a/src/widgets/ViewContainer.h
++++ b/src/widgets/ViewContainer.h
+@@ -12,6 +12,7 @@
+ #include <QTabWidget>
+ 
+ // Konsole
++#include "TerminalProgress.h"
+ #include "ViewManager.h"
+ #include "containers/ContainerInfo.h"
+ #include "session/Session.h"
+@@ -217,7 +218,7 @@ Q_SIGNALS:
+     void removeColor(int idx);
+ 
+     /** set the tab progress */
+-    void setProgress(int idx, const std::optional<int> &progress);
++    void setProgress(int idx, const std::optional<TerminalProgress> &progress);
+ 
+     /** set the activity color tab */
+     void setActivityColor(int index, const QColor &color);
+-- 
+2.56.0
+

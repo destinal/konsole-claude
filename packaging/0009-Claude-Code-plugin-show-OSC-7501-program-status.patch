@@ -1,0 +1,1008 @@
+From 20a54601f8b8a2b066547ac2763ceedcd8f937e6 Mon Sep 17 00:00:00 2001
+From: Eric Duprey <509630+destinal@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 13:52:58 -0700
+Subject: [PATCH 09/17] Claude Code plugin: show OSC 7501 program status
+
+Konsole now answers the Program Status Protocol's feature query, so
+Claude Code reports its own state: working, blocked on a permission or a
+question, done, and idle, including when the user interrupts a turn,
+which runs no hook. The plugin keeps the reports as records, one per id,
+and shows the most urgent through the session status it shares with the
+hooks and OSC 21337, whichever wrote last. A port of iTerm2's
+ProgramStatusRecords and the status half of its ProgramStatusController:
+
+- a report replaces its record; clear removes a record and its
+  descendants, or every record; past 256 the oldest is evicted;
+- blocked, error, done, working, idle, in that order of urgency, the
+  most recent winning ties, with app inherited from an ancestor;
+- a new prompt ends working, blocked and idle records, a key press turns
+  done and error idle, a full reset or the program exiting removes all;
+- the status uses cc-status's words and colors, and the detail is the
+  message, the kind of block, or a child record's title.
+
+With Claude Code reporting interrupts itself, sessions no longer need to
+pass as ConEmu to get OSC 9;4 progress from it, so that is removed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/plugins/ClaudeCode/CMakeLists.txt         |   1 +
+ .../ClaudeCode/autotests/CMakeLists.txt       |  11 +
+ .../autotests/ProgramStatusRecordsTest.cpp    | 301 +++++++++++++++++
+ src/plugins/ClaudeCode/claudecodeplugin.cpp   |  17 +-
+ .../ClaudeCode/programstatusrecords.cpp       | 307 ++++++++++++++++++
+ src/plugins/ClaudeCode/programstatusrecords.h | 117 +++++++
+ src/plugins/ClaudeCode/sessionstatus.cpp      |   3 +
+ src/plugins/ClaudeCode/sessionstatus.h        |   7 +
+ .../ClaudeCode/sessionstatusregistry.cpp      |  27 +-
+ .../ClaudeCode/sessionstatusregistry.h        |  10 +-
+ 10 files changed, 782 insertions(+), 19 deletions(-)
+ create mode 100644 src/plugins/ClaudeCode/autotests/ProgramStatusRecordsTest.cpp
+ create mode 100644 src/plugins/ClaudeCode/programstatusrecords.cpp
+ create mode 100644 src/plugins/ClaudeCode/programstatusrecords.h
+
+diff --git a/src/plugins/ClaudeCode/CMakeLists.txt b/src/plugins/ClaudeCode/CMakeLists.txt
+index 6f9f6eb..c02979f 100644
+--- a/src/plugins/ClaudeCode/CMakeLists.txt
++++ b/src/plugins/ClaudeCode/CMakeLists.txt
+@@ -3,6 +3,7 @@ SOURCES
+     claudecodeplugin.cpp
+     claudecodedbus.cpp
+     claudesessionswidget.cpp
++    programstatusrecords.cpp
+     sessionstatus.cpp
+     sessionstatusregistry.cpp
+ INSTALL_NAMESPACE
+diff --git a/src/plugins/ClaudeCode/autotests/CMakeLists.txt b/src/plugins/ClaudeCode/autotests/CMakeLists.txt
+index 6105931..c5975ef 100644
+--- a/src/plugins/ClaudeCode/autotests/CMakeLists.txt
++++ b/src/plugins/ClaudeCode/autotests/CMakeLists.txt
+@@ -8,3 +8,14 @@ ecm_add_test(
+     LINK_LIBRARIES Qt::Test konsoleprivate
+ )
+ target_include_directories(ClaudeCodeSessionStatusTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
++
++ecm_add_test(
++    ProgramStatusRecordsTest.cpp
++    ../programstatusrecords.cpp
++    ../programstatusrecords.h
++    ../sessionstatus.cpp
++    ../sessionstatus.h
++    TEST_NAME ClaudeCodeProgramStatusRecordsTest
++    LINK_LIBRARIES Qt::Test KF6::I18n konsoleprivate
++)
++target_include_directories(ClaudeCodeProgramStatusRecordsTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+diff --git a/src/plugins/ClaudeCode/autotests/ProgramStatusRecordsTest.cpp b/src/plugins/ClaudeCode/autotests/ProgramStatusRecordsTest.cpp
+new file mode 100644
+index 0000000..bfd03a6
+--- /dev/null
++++ b/src/plugins/ClaudeCode/autotests/ProgramStatusRecordsTest.cpp
+@@ -0,0 +1,301 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// Ports the record-model tests of iTerm2 (ProgramStatusTests) and checks how
++// OSC 7501 records share a session's status with the hooks.
++
++#include "programstatusrecords.h"
++#include "sessionstatus.h"
++
++#include <QTest>
++
++using Konsole::ProgramStatusReport;
++
++namespace
++{
++ProgramStatusReport report(const char *body)
++{
++    return *ProgramStatusReport::parse(QString::fromUtf8(body));
++}
++
++QString text(const SessionStatus &status)
++{
++    return status.statusText().value_or(QStringLiteral("<none>"));
++}
++
++QString detail(const SessionStatus &status)
++{
++    return status.detail().value_or(QStringLiteral("<none>"));
++}
++
++// base64 of "Pushing image", "US East", "Push failed".
++const char *const pushing = "UHVzaGluZyBpbWFnZQ";
++}
++
++class ProgramStatusRecordsTest : public QObject
++{
++    Q_OBJECT
++
++private Q_SLOTS:
++    void testReportReplacesItsRecord();
++    void testClearRemovesDescendantsOnly();
++    void testClearWithoutIdRemovesEverything();
++    void testCapacityEvictsTheOldest();
++    void testMostUrgentWins();
++    void testAppIsInherited();
++    void testMarkSeenKeepsText();
++
++    void testReportSetsTheStatus();
++    void testBlockedWithoutMessageDescribesTheKind();
++    void testChildTitlePrefixesTheDetail();
++    void testReportWithoutMessageClearsTheDetail();
++    void testClearingTheLastRecordClearsTheStatus();
++    void testReportSupersedesAHookExpiration();
++    void testOtherWriterKeepsTheStatus();
++    void testPromptEndsTransientRecords();
++    void testKeyPressMarksFinishedRecordsSeen();
++    void testTerminalResetRemovesRecords();
++    void testSanitizedText();
++};
++
++void ProgramStatusRecordsTest::testReportReplacesItsRecord()
++{
++    ProgramStatusRecords records;
++    records.apply(report("state=working:app=brew:progress=30"));
++    records.apply(report("state=blocked:kind=auth"));
++    const auto record = records.record({});
++    QCOMPARE(record->report.state, ProgramStatusReport::Blocked);
++    QVERIFY(!record->report.app.has_value());
++    QVERIFY(!record->report.progress.has_value());
++    QCOMPARE(records.size(), 1);
++}
++
++void ProgramStatusRecordsTest::testClearRemovesDescendantsOnly()
++{
++    ProgramStatusRecords records;
++    records.apply(report("state=working:id=a"));
++    records.apply(report("state=working:id=a/b"));
++    records.apply(report("state=working:id=a/b/c"));
++    records.apply(report("state=working:id=ab"));
++    records.apply(report("state=working"));
++    records.apply(report("state=clear:id=a"));
++    QCOMPARE(records.size(), 2);
++    QVERIFY(records.record({QStringLiteral("ab")}).has_value());
++    QVERIFY(records.record({}).has_value());
++}
++
++void ProgramStatusRecordsTest::testClearWithoutIdRemovesEverything()
++{
++    ProgramStatusRecords records;
++    records.apply(report("state=working:id=a"));
++    records.apply(report("state=done"));
++    records.apply(report("state=clear"));
++    QVERIFY(records.isEmpty());
++}
++
++void ProgramStatusRecordsTest::testCapacityEvictsTheOldest()
++{
++    ProgramStatusRecords records(3);
++    records.apply(report("state=working:id=one"));
++    records.apply(report("state=working:id=two"));
++    records.apply(report("state=working:id=three"));
++    // Rewriting a record makes it recent again; it does not grow the set.
++    records.apply(report("state=done:id=one"));
++    records.apply(report("state=working:id=four"));
++    QCOMPARE(records.size(), 3);
++    QVERIFY(!records.record({QStringLiteral("two")}).has_value());
++    QVERIFY(records.record({QStringLiteral("one")}).has_value());
++}
++
++void ProgramStatusRecordsTest::testMostUrgentWins()
++{
++    ProgramStatusRecords records;
++    records.apply(report("state=blocked:id=a"));
++    records.apply(report("state=working:id=b"));
++    QCOMPARE(records.mostUrgent()->report.id, QStringList{QStringLiteral("a")});
++    records.apply(report("state=error:id=c"));
++    records.apply(report("state=blocked:id=d"));
++    // Equally urgent: the most recently written wins.
++    QCOMPARE(records.mostUrgent()->report.id, QStringList{QStringLiteral("d")});
++}
++
++void ProgramStatusRecordsTest::testAppIsInherited()
++{
++    ProgramStatusRecords records;
++    records.apply(report("state=working:app=deploy"));
++    records.apply(report("state=blocked:id=us/east"));
++    QCOMPARE(records.mostUrgent()->report.app, QStringLiteral("deploy"));
++}
++
++void ProgramStatusRecordsTest::testMarkSeenKeepsText()
++{
++    ProgramStatusRecords records;
++    records.apply(report("state=done:msg=RGVwbG95ZWQ"));
++    QVERIFY(records.markSeen({ProgramStatusReport::Done, ProgramStatusReport::Error}));
++    QCOMPARE(records.record({})->report.state, ProgramStatusReport::Idle);
++    QCOMPARE(records.record({})->report.msg, QStringLiteral("Deployed"));
++    QVERIFY(!records.markSeen({ProgramStatusReport::Done}));
++}
++
++void ProgramStatusRecordsTest::testReportSetsTheStatus()
++{
++    SessionStatus status;
++    ProgramStatusController controller(&status);
++    controller.handle(report(QStringLiteral("state=working:app=claude-code:msg=%1").arg(QLatin1String(pushing)).toUtf8().constData()));
++    QCOMPARE(text(status), QStringLiteral("working"));
++    QCOMPARE(status.indicator().name(), QStringLiteral("#ff9500"));
++    QCOMPARE(status.statusColor().name(), QStringLiteral("#ff9500"));
++    QCOMPARE(detail(status), QStringLiteral("Pushing image"));
++
++    controller.handle(report("state=blocked"));
++    QCOMPARE(text(status), QStringLiteral("waiting"));
++    QCOMPARE(status.indicator().name(), QStringLiteral("#5f87ff"));
++    controller.handle(report("state=error"));
++    QCOMPARE(status.indicator().name(), QStringLiteral("#ff3b30"));
++    controller.handle(report("state=idle"));
++    QCOMPARE(status.statusColor().name(), QStringLiteral("#888888"));
++}
++
++void ProgramStatusRecordsTest::testBlockedWithoutMessageDescribesTheKind()
++{
++    SessionStatus status;
++    ProgramStatusController controller(&status);
++    controller.handle(report("state=blocked:kind=permission"));
++    QCOMPARE(detail(status), QStringLiteral("Waiting for approval"));
++    controller.handle(report("state=blocked:kind=question"));
++    QCOMPARE(detail(status), QStringLiteral("Waiting for an answer"));
++    controller.handle(report("state=blocked:kind=auth"));
++    QCOMPARE(detail(status), QStringLiteral("Waiting for login"));
++}
++
++void ProgramStatusRecordsTest::testChildTitlePrefixesTheDetail()
++{
++    SessionStatus status;
++    ProgramStatusController controller(&status);
++    controller.handle(report(QStringLiteral("state=working:id=us-east:title=VVMgRWFzdA:msg=%1").arg(QLatin1String(pushing)).toUtf8().constData()));
++    QCOMPARE(detail(status), QStringLiteral("US East: Pushing image"));
++    // A child with only a title shows the title.
++    controller.handle(report("state=error:id=us-east:title=VVMgRWFzdA"));
++    QCOMPARE(detail(status), QStringLiteral("US East"));
++    // The root record's title is the window title already, so it adds nothing.
++    controller.handle(report("state=clear"));
++    controller.handle(report("state=working:title=VVMgRWFzdA"));
++    QCOMPARE(detail(status), QStringLiteral("<none>"));
++}
++
++void ProgramStatusRecordsTest::testReportWithoutMessageClearsTheDetail()
++{
++    SessionStatus status;
++    ProgramStatusController controller(&status);
++    controller.handle(report(QStringLiteral("state=working:msg=%1").arg(QLatin1String(pushing)).toUtf8().constData()));
++    controller.handle(report("state=working"));
++    QVERIFY(!status.detail().has_value());
++}
++
++void ProgramStatusRecordsTest::testClearingTheLastRecordClearsTheStatus()
++{
++    SessionStatus status;
++    ProgramStatusController controller(&status);
++    controller.handle(report("state=working:id=a"));
++    controller.handle(report("state=blocked:id=b"));
++    controller.handle(report("state=clear:id=b"));
++    QCOMPARE(text(status), QStringLiteral("working"));
++    controller.handle(report("state=clear"));
++    QVERIFY(!status.hasActiveStatus());
++}
++
++void ProgramStatusRecordsTest::testReportSupersedesAHookExpiration()
++{
++    // A hook said "working until the turn's progress ends". The program
++    // reports idle itself when the user interrupts; that report wins and
++    // nothing is left to expire.
++    SessionStatus status(nullptr, 30);
++    ProgramStatusController controller(&status);
++    StatusUpdate working;
++    working.fields.status = QStringLiteral("working");
++    working.expiresOnProgressEnd = true;
++    working.fallback.status = QStringLiteral("done");
++    status.apply(working);
++    controller.handle(report("state=idle"));
++    QCOMPARE(text(status), QStringLiteral("idle"));
++    QVERIFY(!status.hasArmedExpiration());
++}
++
++void ProgramStatusRecordsTest::testOtherWriterKeepsTheStatus()
++{
++    SessionStatus status;
++    ProgramStatusController controller(&status);
++    controller.handle(report("state=working"));
++
++    // A hook writes after the record.
++    StatusUpdate hook;
++    hook.fields.status = QStringLiteral("waiting");
++    hook.fields.detail = QStringLiteral("Allow Bash: rm -rf build?");
++    status.apply(hook);
++
++    // A prompt ends the working record, but the hook's status stays.
++    controller.promptStarted();
++    QCOMPARE(text(status), QStringLiteral("waiting"));
++    QCOMPARE(detail(status), QStringLiteral("Allow Bash: rm -rf build?"));
++
++    // Bookkeeping is not a write of the status: the next report still shows.
++    StatusUpdate count;
++    count.backgroundTasks = 1;
++    status.apply(count);
++    controller.handle(report("state=done"));
++    QCOMPARE(text(status), QStringLiteral("done"));
++}
++
++void ProgramStatusRecordsTest::testPromptEndsTransientRecords()
++{
++    SessionStatus status;
++    ProgramStatusController controller(&status);
++    controller.handle(report("state=done:id=build"));
++    controller.handle(report("state=blocked:id=deploy"));
++    QCOMPARE(text(status), QStringLiteral("waiting"));
++    controller.promptStarted();
++    QCOMPARE(controller.records().size(), 1);
++    QCOMPARE(text(status), QStringLiteral("done"));
++
++    controller.handle(report("state=clear"));
++    controller.handle(report("state=working"));
++    controller.promptStarted();
++    QVERIFY(!status.hasActiveStatus());
++}
++
++void ProgramStatusRecordsTest::testKeyPressMarksFinishedRecordsSeen()
++{
++    SessionStatus status;
++    ProgramStatusController controller(&status);
++    controller.handle(report("state=done:msg=RGVwbG95ZWQ"));
++    controller.userDidPressKey();
++    QCOMPARE(text(status), QStringLiteral("idle"));
++    QCOMPARE(detail(status), QStringLiteral("Deployed"));
++
++    // Working is not something to acknowledge.
++    controller.handle(report("state=working"));
++    controller.userDidPressKey();
++    QCOMPARE(text(status), QStringLiteral("working"));
++}
++
++void ProgramStatusRecordsTest::testTerminalResetRemovesRecords()
++{
++    SessionStatus status;
++    ProgramStatusController controller(&status);
++    controller.handle(report("state=error"));
++    controller.terminalReset();
++    QVERIFY(controller.records().isEmpty());
++    QVERIFY(!status.hasActiveStatus());
++}
++
++void ProgramStatusRecordsTest::testSanitizedText()
++{
++    // U+202E (right-to-left override) is built here rather than written, since
++    // compilers rightly warn about it in source.
++    const QString input = QStringLiteral("evil") + QChar(0x202E) + QStringLiteral("txt.exe line\u2028two \U0001F468\u200D\U0001F469");
++    QCOMPARE(ProgramStatusController::sanitized(input), QStringLiteral("eviltxt.exe linetwo \U0001F468\u200D\U0001F469"));
++}
++
++QTEST_GUILESS_MAIN(ProgramStatusRecordsTest)
++
++#include "ProgramStatusRecordsTest.moc"
+diff --git a/src/plugins/ClaudeCode/claudecodeplugin.cpp b/src/plugins/ClaudeCode/claudecodeplugin.cpp
+index 79fa73a..b2a9374 100644
+--- a/src/plugins/ClaudeCode/claudecodeplugin.cpp
++++ b/src/plugins/ClaudeCode/claudecodeplugin.cpp
+@@ -5,13 +5,12 @@
+ #include "claudecodedbus.h"
+ #include "claudesessionswidget.h"
+ #include "konsoledebug.h"
++#include "programstatusrecords.h"
+ #include "sessionstatus.h"
+ #include "sessionstatusregistry.h"
+ 
+ #include "MainWindow.h"
+-#include "session/Session.h"
+ #include "session/SessionController.h"
+-#include "session/SessionManager.h"
+ #include "terminalDisplay/TerminalDisplay.h"
+ 
+ #include <KActionCollection>
+@@ -33,15 +32,6 @@ ClaudeCodePlugin::ClaudeCodePlugin(QObject *object, const QVariantList &args)
+     setName(QStringLiteral("ClaudeCode"));
+ 
+     priv->registry = new SessionStatusRegistry(this);
+-
+-    // Claude Code reports a turn's start and end with OSC 9;4 progress only to
+-    // terminals it recognizes, ConEmu among them; without the end of a turn,
+-    // an interrupt (which runs no hook) leaves the status on "working". Until
+-    // Konsole speaks Claude Code's own status protocol (OSC 7501), pass as
+-    // ConEmu. This must happen before the session's program starts.
+-    connect(Konsole::SessionManager::instance(), &Konsole::SessionManager::sessionCreated, this, [](Konsole::Session *session) {
+-        session->addEnvironmentEntry(QStringLiteral("ConEmuANSI=ON"));
+-    });
+     auto *dbus = new ClaudeCodeDBus(priv->registry, this);
+     if (!dbus->registerObject()) {
+         qCWarning(KonsoleDebug) << "Claude Code plugin could not register /ClaudeCode on D-Bus";
+@@ -78,6 +68,11 @@ void ClaudeCodePlugin::activeViewChanged(Konsole::SessionController *controller,
+     SessionStatus *status = priv->registry->status(controller->session());
+     if (status != nullptr) {
+         connect(controller->view(), &Konsole::TerminalDisplay::keyPressedSignal, status, &SessionStatus::userDidPressKey, Qt::UniqueConnection);
++        connect(controller->view(),
++                &Konsole::TerminalDisplay::keyPressedSignal,
++                priv->registry->programStatus(controller->session()),
++                &ProgramStatusController::userDidPressKey,
++                Qt::UniqueConnection);
+     }
+ }
+ 
+diff --git a/src/plugins/ClaudeCode/programstatusrecords.cpp b/src/plugins/ClaudeCode/programstatusrecords.cpp
+new file mode 100644
+index 0000000..cd91914
+--- /dev/null
++++ b/src/plugins/ClaudeCode/programstatusrecords.cpp
+@@ -0,0 +1,307 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "programstatusrecords.h"
++#include "sessionstatus.h"
++
++#include <KLocalizedString>
++
++#include <QColor>
++
++using Konsole::ProgramStatusReport;
++
++namespace
++{
++using State = ProgramStatusReport::State;
++
++const QSet<State> transientStates = {ProgramStatusReport::Working, ProgramStatusReport::Blocked, ProgramStatusReport::Idle};
++const QSet<State> finishedStates = {ProgramStatusReport::Done, ProgramStatusReport::Error};
++
++int urgency(State state)
++{
++    switch (state) {
++    case ProgramStatusReport::Blocked:
++        return 5;
++    case ProgramStatusReport::Error:
++        return 4;
++    case ProgramStatusReport::Done:
++        return 3;
++    case ProgramStatusReport::Working:
++        return 2;
++    case ProgramStatusReport::Idle:
++        return 1;
++    case ProgramStatusReport::Clear:
++        break;
++    }
++    return 0;
++}
++
++QString key(const QStringList &id)
++{
++    return id.join(QLatin1Char('/'));
++}
++
++std::optional<QString> kindDescription(const std::optional<ProgramStatusReport::Kind> &kind)
++{
++    if (!kind.has_value()) {
++        return std::nullopt;
++    }
++    switch (*kind) {
++    case ProgramStatusReport::Permission:
++        return i18n("Waiting for approval");
++    case ProgramStatusReport::Question:
++        return i18n("Waiting for an answer");
++    case ProgramStatusReport::Auth:
++        return i18n("Waiting for login");
++    }
++    return std::nullopt;
++}
++}
++
++ProgramStatusRecords::ProgramStatusRecords(int capacity)
++    : _capacity(capacity)
++{
++}
++
++bool ProgramStatusRecords::isEmpty() const
++{
++    return _records.isEmpty();
++}
++
++int ProgramStatusRecords::size() const
++{
++    return _records.size();
++}
++
++std::optional<ProgramStatusRecords::Record> ProgramStatusRecords::record(const QStringList &id) const
++{
++    const auto it = _records.constFind(key(id));
++    return it == _records.cend() ? std::nullopt : std::optional(*it);
++}
++
++void ProgramStatusRecords::apply(const ProgramStatusReport &report)
++{
++    const QString recordKey = key(report.id);
++    if (report.state == ProgramStatusReport::Clear) {
++        if (report.id.isEmpty()) {
++            _records.clear();
++        } else {
++            const QString prefix = recordKey + QLatin1Char('/');
++            _records.removeIf([&](const auto &it) {
++                return it.key() == recordKey || it.key().startsWith(prefix);
++            });
++        }
++        return;
++    }
++    // A new record over capacity evicts the least recently written one.
++    if (!_records.contains(recordKey) && _records.size() >= _capacity) {
++        auto oldest = _records.begin();
++        for (auto it = _records.begin(); it != _records.end(); ++it) {
++            if (it->serial < oldest->serial) {
++                oldest = it;
++            }
++        }
++        _records.erase(oldest);
++    }
++    _records.insert(recordKey, Record{report, ++_serial});
++}
++
++bool ProgramStatusRecords::remove(const QSet<State> &states)
++{
++    return _records.removeIf([&states](const auto &it) {
++        return states.contains(it->report.state);
++    }) > 0;
++}
++
++void ProgramStatusRecords::removeAll()
++{
++    _records.clear();
++}
++
++bool ProgramStatusRecords::markSeen(const QSet<State> &states)
++{
++    bool changed = false;
++    for (auto &record : _records) {
++        if (states.contains(record.report.state)) {
++            // The program did not write this, so the record keeps its serial.
++            record.report.state = ProgramStatusReport::Idle;
++            changed = true;
++        }
++    }
++    return changed;
++}
++
++std::optional<ProgramStatusRecords::Record> ProgramStatusRecords::mostUrgent() const
++{
++    const Record *best = nullptr;
++    for (const Record &record : _records) {
++        if (best == nullptr) {
++            best = &record;
++            continue;
++        }
++        const int candidate = urgency(record.report.state);
++        const int current = urgency(best->report.state);
++        if (candidate > current || (candidate == current && record.serial > best->serial)) {
++            best = &record;
++        }
++    }
++    if (best == nullptr) {
++        return std::nullopt;
++    }
++    Record result = *best;
++    if (!result.report.app.has_value()) {
++        result.report.app = inheritedApp(result.report.id);
++    }
++    return result;
++}
++
++std::optional<QString> ProgramStatusRecords::inheritedApp(QStringList id) const
++{
++    while (!id.isEmpty()) {
++        id.removeLast();
++        const auto it = _records.constFind(key(id));
++        if (it != _records.cend() && it->report.app.has_value()) {
++            return it->report.app;
++        }
++    }
++    return std::nullopt;
++}
++
++ProgramStatusController::ProgramStatusController(SessionStatus *status, QObject *parent)
++    : QObject(parent)
++    , _status(status)
++{
++    connect(_status, &SessionStatus::asserted, this, [this] {
++        if (!_applying) {
++            otherWriterDidSetStatus();
++        }
++    });
++}
++
++const ProgramStatusRecords &ProgramStatusController::records() const
++{
++    return _records;
++}
++
++void ProgramStatusController::handle(const ProgramStatusReport &report)
++{
++    _records.apply(report);
++    refresh(true);
++}
++
++void ProgramStatusController::promptStarted()
++{
++    if (_records.remove(transientStates) && _isShowingStatus) {
++        refresh(true);
++    }
++}
++
++void ProgramStatusController::terminalReset()
++{
++    _records.removeAll();
++    refresh(_isShowingStatus);
++}
++
++void ProgramStatusController::programExited()
++{
++    _records.removeAll();
++    _isShowingStatus = false;
++}
++
++void ProgramStatusController::userDidPressKey()
++{
++    if (_records.markSeen(finishedStates)) {
++        refresh(_isShowingStatus);
++    }
++}
++
++void ProgramStatusController::otherWriterDidSetStatus()
++{
++    _isShowingStatus = false;
++}
++
++void ProgramStatusController::refresh(bool showingStatus)
++{
++    if (!showingStatus) {
++        return;
++    }
++    const auto record = _records.mostUrgent();
++    StatusUpdate update;
++    if (record.has_value()) {
++        update = statusUpdate(*record);
++    } else if (_isShowingStatus) {
++        // The records put the status up and none are left.
++        update.fields = Konsole::TabStatusFields::cleared();
++    } else {
++        return;
++    }
++    _applying = true;
++    _status->apply(update);
++    _applying = false;
++    _isShowingStatus = record.has_value();
++}
++
++StatusUpdate ProgramStatusController::statusUpdate(const ProgramStatusRecords::Record &record)
++{
++    // The same words and colors cc-status writes, so a program using the
++    // protocol looks like Claude Code with its hooks installed.
++    struct Look {
++        const char *status;
++        QRgb indicator;
++        QRgb text;
++    };
++    Look look = {"error", 0xff3b30, 0xff3b30};
++    switch (record.report.state) {
++    case ProgramStatusReport::Idle:
++        look = {"idle", 0x00d75f, 0x888888};
++        break;
++    case ProgramStatusReport::Working:
++        look = {"working", 0xff9500, 0xff9500};
++        break;
++    case ProgramStatusReport::Blocked:
++        look = {"waiting", 0x5f87ff, 0x5f87ff};
++        break;
++    case ProgramStatusReport::Done:
++        look = {"done", 0x00d75f, 0x00d75f};
++        break;
++    case ProgramStatusReport::Error:
++    case ProgramStatusReport::Clear:
++        break;
++    }
++
++    StatusUpdate update;
++    update.fields.status = QLatin1String(look.status);
++    update.fields.indicator = QColor::fromRgb(look.indicator);
++    update.fields.statusColor = QColor::fromRgb(look.text);
++
++    const auto &report = record.report;
++    std::optional<QString> message = report.msg.has_value() ? std::optional(sanitized(*report.msg)) : kindDescription(report.kind);
++    // The root record's label is normally the window title already, so only
++    // a child record's title adds anything.
++    const QString title = report.id.isEmpty() ? QString() : sanitized(report.title.value_or(QString()));
++    if (!title.isEmpty()) {
++        message = message.has_value() && !message->isEmpty() ? i18nc("@info a task's name, then what it is doing", "%1: %2", title, *message) : title;
++    }
++    // Every report replaces its record, so nothing from an earlier one may linger.
++    update.fields.detail = message.value_or(QString());
++    return update;
++}
++
++QString ProgramStatusController::sanitized(const QString &text)
++{
++    QString result;
++    result.reserve(text.size());
++    for (const char32_t ucs4 : text.toUcs4()) {
++        const QChar::Category category = QChar::category(ucs4);
++        // Keep the joiners that build emoji and shape scripts, and the tag
++        // characters in subdivision flags.
++        const bool keptFormat = ucs4 == 0x200C || ucs4 == 0x200D || (ucs4 >= 0xE0020 && ucs4 <= 0xE007F);
++        if ((category == QChar::Other_Format && !keptFormat) || category == QChar::Separator_Line || category == QChar::Separator_Paragraph) {
++            continue;
++        }
++        result.append(QString::fromUcs4(&ucs4, 1));
++    }
++    return result;
++}
++
++#include "moc_programstatusrecords.cpp"
+diff --git a/src/plugins/ClaudeCode/programstatusrecords.h b/src/plugins/ClaudeCode/programstatusrecords.h
+new file mode 100644
+index 0000000..71db74b
+--- /dev/null
++++ b/src/plugins/ClaudeCode/programstatusrecords.h
+@@ -0,0 +1,117 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#ifndef PROGRAMSTATUSRECORDS_H
++#define PROGRAMSTATUSRECORDS_H
++
++#include "ProgramStatus.h"
++
++#include <QHash>
++#include <QObject>
++#include <QSet>
++
++#include <optional>
++
++class SessionStatus;
++struct StatusUpdate;
++
++/**
++ * The Program Status Protocol (OSC 7501) records a session holds, one per
++ * id. Each report replaces its record completely. A port of iTerm2's
++ * ProgramStatusRecords.
++ */
++class ProgramStatusRecords
++{
++public:
++    struct Record {
++        Konsole::ProgramStatusReport report;
++        /** When the record was last written, for eviction and for breaking ties. */
++        int serial = 0;
++    };
++
++    static constexpr int defaultCapacity = 256;
++
++    explicit ProgramStatusRecords(int capacity = defaultCapacity);
++
++    bool isEmpty() const;
++    int size() const;
++    std::optional<Record> record(const QStringList &id) const;
++
++    /** Applies a report: replaces its record, or for Clear removes it and its descendants. */
++    void apply(const Konsole::ProgramStatusReport &report);
++
++    /** Removes the records in any of @p states. Returns whether anything was removed. */
++    bool remove(const QSet<Konsole::ProgramStatusReport::State> &states);
++
++    void removeAll();
++
++    /** Turns the records in any of @p states idle, keeping their text. Returns whether anything changed. */
++    bool markSeen(const QSet<Konsole::ProgramStatusReport::State> &states);
++
++    /**
++     * The record most in need of the user (blocked, error, done, working,
++     * idle), the most recently written among equals, with its app inherited
++     * from its nearest ancestor when it has none.
++     */
++    std::optional<Record> mostUrgent() const;
++
++private:
++    std::optional<QString> inheritedApp(QStringList id) const;
++
++    const int _capacity;
++    QHash<QString, Record> _records;
++    int _serial = 0;
++};
++
++/**
++ * Shows a session's OSC 7501 records through its SessionStatus, which they
++ * share with the hooks and OSC 21337: whichever wrote last is what shows.
++ * A port of the status half of iTerm2's ProgramStatusController.
++ */
++class ProgramStatusController : public QObject
++{
++    Q_OBJECT
++
++public:
++    explicit ProgramStatusController(SessionStatus *status, QObject *parent = nullptr);
++
++    const ProgramStatusRecords &records() const;
++
++    /** The program sent a report. */
++    void handle(const Konsole::ProgramStatusReport &report);
++
++    /**
++     * A new shell prompt began: working, blocked and idle records end with
++     * the command; done and error stay until the user has seen them.
++     */
++    void promptStarted();
++
++    /** A full reset removes every record. */
++    void terminalReset();
++
++    /** The session's program exited. */
++    void programExited();
++
++    /** The user pressed a key: done and error records have been seen and become idle. */
++    void userDidPressKey();
++
++    /** The status update that shows @p record. Every field is set or cleared. */
++    static StatusUpdate statusUpdate(const ProgramStatusRecords::Record &record);
++
++    /** Removes invisible formatting characters and line separators from text shown outside the terminal. */
++    static QString sanitized(const QString &text);
++
++private:
++    void refresh(bool showingStatus);
++    void otherWriterDidSetStatus();
++
++    SessionStatus *_status;
++    ProgramStatusRecords _records;
++    // Whether the status showing came from a record. Once something else
++    // writes the status, changes the program did not report (a prompt, a key
++    // press) must not overwrite it.
++    bool _isShowingStatus = false;
++    bool _applying = false;
++};
++
++#endif // PROGRAMSTATUSRECORDS_H
+diff --git a/src/plugins/ClaudeCode/sessionstatus.cpp b/src/plugins/ClaudeCode/sessionstatus.cpp
+index b534c6d..53f33c9 100644
+--- a/src/plugins/ClaudeCode/sessionstatus.cpp
++++ b/src/plugins/ClaudeCode/sessionstatus.cpp
+@@ -257,6 +257,9 @@ bool SessionStatus::apply(const StatusUpdate &update)
+     if (applyToState(update)) {
+         Q_EMIT changed(previousText);
+     }
++    if (asserts) {
++        Q_EMIT asserted();
++    }
+ 
+     // A count arriving after the head start may report that the last of the
+     // background work holding an expiration has finished. Only a count can
+diff --git a/src/plugins/ClaudeCode/sessionstatus.h b/src/plugins/ClaudeCode/sessionstatus.h
+index 619aed8..88f7b40 100644
+--- a/src/plugins/ClaudeCode/sessionstatus.h
++++ b/src/plugins/ClaudeCode/sessionstatus.h
+@@ -121,6 +121,13 @@ Q_SIGNALS:
+     /** Something visible changed. */
+     void changed(const std::optional<QString> &previousStatusText);
+ 
++    /**
++     * An update that says something about what the session is doing was
++     * applied, as opposed to one that only parked bookkeeping. Emitted
++     * whether or not anything visible changed.
++     */
++    void asserted();
++
+ private:
+     struct Display {
+         QColor indicator;
+diff --git a/src/plugins/ClaudeCode/sessionstatusregistry.cpp b/src/plugins/ClaudeCode/sessionstatusregistry.cpp
+index bee1f10..610cf22 100644
+--- a/src/plugins/ClaudeCode/sessionstatusregistry.cpp
++++ b/src/plugins/ClaudeCode/sessionstatusregistry.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "sessionstatusregistry.h"
++#include "programstatusrecords.h"
+ #include "sessionstatus.h"
+ 
+ #include "Emulation.h"
+@@ -21,7 +22,12 @@ SessionStatusRegistry::SessionStatusRegistry(QObject *parent)
+ 
+ SessionStatus *SessionStatusRegistry::status(Konsole::Session *session) const
+ {
+-    return _statuses.value(session);
++    return _sessions.value(session).status;
++}
++
++ProgramStatusController *SessionStatusRegistry::programStatus(Konsole::Session *session) const
++{
++    return _sessions.value(session).programStatus;
+ }
+ 
+ Konsole::Session *SessionStatusRegistry::session(const QString &identifier) const
+@@ -32,7 +38,7 @@ Konsole::Session *SessionStatusRegistry::session(const QString &identifier) cons
+     if (!ok) {
+         return nullptr;
+     }
+-    for (auto it = _statuses.cbegin(); it != _statuses.cend(); ++it) {
++    for (auto it = _sessions.cbegin(); it != _sessions.cend(); ++it) {
+         if (it.key()->sessionId() == id) {
+             return it.key();
+         }
+@@ -42,27 +48,34 @@ Konsole::Session *SessionStatusRegistry::session(const QString &identifier) cons
+ 
+ QList<Konsole::Session *> SessionStatusRegistry::sessions() const
+ {
+-    return _statuses.keys();
++    return _sessions.keys();
+ }
+ 
+ void SessionStatusRegistry::track(Konsole::Session *session)
+ {
+-    if (_statuses.contains(session)) {
++    if (_sessions.contains(session)) {
+         return;
+     }
+     auto *status = new SessionStatus(this);
+-    _statuses.insert(session, status);
++    auto *programStatus = new ProgramStatusController(status, status);
++    _sessions.insert(session, {status, programStatus});
+ 
+-    connect(session->emulation(), &Konsole::Emulation::progressChanged, status, &SessionStatus::progressReported);
++    Konsole::Emulation *emulation = session->emulation();
++    connect(emulation, &Konsole::Emulation::progressChanged, status, &SessionStatus::progressReported);
++    connect(emulation, &Konsole::Emulation::programStatusReported, programStatus, &ProgramStatusController::handle);
++    connect(emulation, &Konsole::Emulation::promptStarted, programStatus, &ProgramStatusController::promptStarted);
++    connect(emulation, &Konsole::Emulation::terminalReset, programStatus, &ProgramStatusController::terminalReset);
+     connect(session, &Konsole::Session::tabStatusReceived, status, [status](const Konsole::TabStatusUpdate &update) {
+         status->apply(StatusUpdate::fromTabStatus(update));
+     });
++    connect(session, &Konsole::Session::finished, programStatus, &ProgramStatusController::programExited);
+     connect(session, &Konsole::Session::finished, status, &SessionStatus::programDidExit);
+     connect(status, &SessionStatus::changed, this, [this, session] {
+         Q_EMIT statusChanged(session);
+     });
+     connect(session, &QObject::destroyed, this, [this, session] {
+-        delete _statuses.take(session);
++        // The status owns its program status controller.
++        delete _sessions.take(session).status;
+     });
+ }
+ 
+diff --git a/src/plugins/ClaudeCode/sessionstatusregistry.h b/src/plugins/ClaudeCode/sessionstatusregistry.h
+index 739e3b2..50ba630 100644
+--- a/src/plugins/ClaudeCode/sessionstatusregistry.h
++++ b/src/plugins/ClaudeCode/sessionstatusregistry.h
+@@ -12,6 +12,7 @@ namespace Konsole
+ class Session;
+ }
+ class SessionStatus;
++class ProgramStatusController;
+ 
+ /**
+  * Keeps a SessionStatus for every Konsole session, from the moment it is
+@@ -28,6 +29,9 @@ public:
+     /** The status of @p session, or nullptr for a session that is not tracked. */
+     SessionStatus *status(Konsole::Session *session) const;
+ 
++    /** The OSC 7501 records of @p session, or nullptr for a session that is not tracked. */
++    ProgramStatusController *programStatus(Konsole::Session *session) const;
++
+     /**
+      * The session named by @p identifier: its D-Bus path (/Sessions/3) or
+      * its number (3). Returns nullptr when there is none.
+@@ -43,7 +47,11 @@ Q_SIGNALS:
+ private:
+     void track(Konsole::Session *session);
+ 
+-    QHash<Konsole::Session *, SessionStatus *> _statuses;
++    struct Tracked {
++        SessionStatus *status;
++        ProgramStatusController *programStatus;
++    };
++    QHash<Konsole::Session *, Tracked> _sessions;
+ };
+ 
+ #endif // SESSIONSTATUSREGISTRY_H
+-- 
+2.56.0
+

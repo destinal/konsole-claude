@@ -1,0 +1,120 @@
+# Maintainer: Eric Duprey <509630+destinal@users.noreply.github.com>
+# Based on Arch Linux's konsole package (Felix Yan, Antonio Rojas).
+#
+# Konsole with a Claude Code integration modeled on iTerm2's: status in tabs,
+# a sessions panel and notifications, workgroups (Chat, Diff, Code Review)
+# and review clippings. The patches are generated from the claude-integration
+# branch of https://github.com/destinal/konsole; update-konsole.sh moves them
+# to a new Konsole release. cc-status is built from ../cc-status.
+
+pkgname=konsole-claude
+_pkgname=konsole
+pkgver=26.08.2
+pkgrel=1
+arch=(x86_64)
+url='https://apps.kde.org/konsole/'
+pkgdesc='KDE terminal emulator, with a Claude Code integration'
+license=(GPL-2.0-or-later
+         LGPL-2.0-or-later
+         GPL-2.0-only) # cc-status and parts of the plugin, from iTerm2
+depends=(glibc
+         icu
+         kbookmarks
+         kcolorscheme
+         kconfig
+         kconfigwidgets
+         kcoreaddons
+         kcrash
+         kdbusaddons
+         kglobalaccel
+         kguiaddons
+         ki18n
+         kiconthemes
+         kio
+         knewstuff
+         knotifications
+         knotifyconfig
+         kparts
+         kpty
+         kservice
+         ktextwidgets
+         kwidgetsaddons
+         kwindowsystem
+         kxmlgui
+         libssh
+         libstdc++
+         libxkbcommon
+         python
+         qt6-base
+         qt6-multimedia
+         sh)
+makedepends=(extra-cmake-modules
+             kdoctools
+             swift-language)
+optdepends=('keditbookmarks: to manage bookmarks'
+            'vim: the default viewer of a Claude workgroup'"'"'s Diff member'
+            'git: the Diff member of Claude workgroups')
+provides=("konsole=$pkgver")
+conflicts=(konsole)
+install=konsole-claude.install
+source=(https://download.kde.org/stable/release-service/$pkgver/src/$_pkgname-$pkgver.tar.xz{,.sig}
+)
+# The patches, in order.
+source+=([0-9][0-9][0-9][0-9]-*.patch)
+sha256sums=('2154a03a952c29be435defffd4c88f9d2eff44a55cdfa33b16a8fc7bfd978217'
+            'SKIP'
+            '33c9aef61a0a6818f2fd27fa7be490944a3beabab9a5cc78263eff665c821b06'
+            'ef762f8de9e372687aecfc6e1a45af52f890beed74ac0bc9debd597e9bad2dfe'
+            '602425cd0d8884de7022c487ecc2430bec02a49ba1dfee40ffb326ddadf4b953'
+            '9e9c5956be64b823cc7786ea0ee595f5513acd569efeb44059c8c4a54dc017d5'
+            'ccccdb2b39771181480bf7e5c9fc916f8ba07c84b8b8b0bf21624e6421275ad4'
+            '0997bad651696f499ec4cf59b2b29fb5f6681233c278c43a5de118a0573c27f8'
+            '6f50ed6e932aee3e2ddc72e49df4d4d54a86411d8232ff6a698a75e67d7f799d'
+            'f2524731d2967bfc313cfd9c7104de6b0b953a9fc861174df0da727830771be4'
+            '3add003005e8fffb5ac54e33ff2420b19b68998d503779615abecc1e71cc7b71'
+            'e8fbaf7e92a80c8be436444cfe0a8087acb74f22ce49822426e51630d6c0e90f'
+            'b3b0317e7497d141ccf267d6e1f84ae3ea4d93e8f5c7705532cbec86eee4c0c9'
+            '8afb4b67a78d4e8b1fa79424ff8b838a84a68d9e69df17bedbaba90c47d49f11'
+            '4fe3fc391b034d6987fb5ab64fd68555748cb5fb54ec8cdef1350d0570609461'
+            '399abb5049787fd984ccd60a7906f4763a5c7997dd4a65d67b4840b4cf252df3'
+            'e5b43b1d974d9d6fdb0906e14db02e84a3eacbbcfd1c39da9141e6c564a5c929'
+            '13ebc7f752ebf8f0d8f0bb83e55160f1b0c9ab298ea8923378fc3937b45be885'
+            'daae41c434191c217bf01719b27c1b47851dc3a345f49015e69184b2b65c516e')
+validpgpkeys=(CA262C6C83DE4D2FB28A332A3A6A4DB839EAA6D7  # Albert Astals Cid <aacid@kde.org>
+              F23275E4BF10AFC1DF6914A6DBD2CE893E2D1C87  # Christoph Feck <cfeck@kde.org>
+              D81C0CB38EB725EF6691C385BB463350D6EF31EF) # Heiko Becker <heiko.becker@kde.org>
+
+prepare() {
+  # iTerm2's cc-status, from this repository.
+  rm -rf cc-status
+  cp -r "$startdir/../cc-status" cc-status
+  rm -rf cc-status/.build
+
+  cd $_pkgname-$pkgver
+  for patch in "$srcdir"/[0-9][0-9][0-9][0-9]-*.patch; do
+    patch -Np1 -i "$patch"
+  done
+}
+
+build() {
+  cmake -B build -S $_pkgname-$pkgver \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DBUILD_TESTING=OFF
+  cmake --build build
+
+  # Statically linked, so it needs no Swift runtime once installed.
+  cd cc-status
+  swift build -c release --static-swift-stdlib \
+    -Xlinker -lCoreFoundation -Xlinker -l_FoundationICU -Xlinker -l_FoundationCShims \
+    -Xlinker -l_FoundationCollections -Xlinker -lFoundationEssentials \
+    -Xlinker -lFoundationInternationalization -Xlinker -lswiftSynchronization
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+
+  # cc-status goes beside it2 and the hook, wherever the build put them.
+  local tools
+  tools=$(dirname "$(find "$pkgdir" -path '*/konsole-claudecode/it2' | head -1)")
+  install -Dm755 cc-status/.build/release/cc-status "$tools/cc-status"
+}

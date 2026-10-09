@@ -1,0 +1,210 @@
+From 0acaa7c324cb86b7737d6271b7563bdc4620b87b Mon Sep 17 00:00:00 2001
+From: Eric Duprey <509630+destinal@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 14:08:28 -0700
+Subject: [PATCH 10/17] Show a session's status dot on its tab
+
+Session::setStatusIndicator gives a session a colored dot, which its tab
+shows in place of its icon. It is meant for plugins that track what the
+session's program is doing; an invalid color removes the dot. Bell,
+activity and silence notifications, broadcast and read-only icons still
+take precedence.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ViewProperties.cpp            | 13 ++++++++++++
+ src/ViewProperties.h              |  5 +++++
+ src/session/Session.cpp           | 14 +++++++++++++
+ src/session/Session.h             |  8 ++++++++
+ src/session/SessionController.cpp |  2 ++
+ src/widgets/ViewContainer.cpp     | 34 +++++++++++++++++++++++++++++--
+ 6 files changed, 74 insertions(+), 2 deletions(-)
+
+diff --git a/src/ViewProperties.cpp b/src/ViewProperties.cpp
+index ca28761..6260c99 100644
+--- a/src/ViewProperties.cpp
++++ b/src/ViewProperties.cpp
+@@ -56,6 +56,19 @@ void ViewProperties::setTitle(const QString &title)
+     }
+ }
+ 
++QColor ViewProperties::statusIndicator() const
++{
++    return _statusIndicator;
++}
++
++void ViewProperties::setStatusIndicator(const QColor &color)
++{
++    if (_statusIndicator != color) {
++        _statusIndicator = color;
++        Q_EMIT iconChanged(this);
++    }
++}
++
+ void ViewProperties::setIcon(const QIcon &icon)
+ {
+     // the icon's cache key is used to determine whether this icon is the same
+diff --git a/src/ViewProperties.h b/src/ViewProperties.h
+index 957115d..25f4b04 100644
+--- a/src/ViewProperties.h
++++ b/src/ViewProperties.h
+@@ -41,6 +41,8 @@ public:
+ 
+     /** Returns the icon associated with a view */
+     QIcon icon() const;
++    /** Returns the color of the status dot shown for the view, or an invalid color for none. */
++    QColor statusIndicator() const;
+     /** Returns the title associated with a view */
+     QString title() const;
+     /** Returns the color associated with a view */
+@@ -124,6 +126,8 @@ protected:
+      * an iconChanged() signal to be emitted
+      */
+     void setIcon(const QIcon &icon);
++    /** Subclasses may call this to show a status dot; emits iconChanged(). */
++    void setStatusIndicator(const QColor &color);
+     /**
+      * Subclasses may call this method to change the color.  This causes
+      * a colorChanged() signal to be emitted
+@@ -145,6 +149,7 @@ private:
+     QIcon _icon;
+     QString _title;
+     QColor _color;
++    QColor _statusIndicator;
+     QColor _activityColor;
+     int _identifier;
+     std::optional<TerminalProgress> _progress;
+diff --git a/src/session/Session.cpp b/src/session/Session.cpp
+index 5f26081..c102b4f 100644
+--- a/src/session/Session.cpp
++++ b/src/session/Session.cpp
+@@ -2431,6 +2431,20 @@ QString Session::tabColor() const
+     return _tabColor.name();
+ }
+ 
++QColor Session::statusIndicator() const
++{
++    return _statusIndicator;
++}
++
++void Session::setStatusIndicator(const QColor &color)
++{
++    if (_statusIndicator == color) {
++        return;
++    }
++    _statusIndicator = color;
++    Q_EMIT sessionAttributeChanged();
++}
++
+ QString Session::userVar(const QString &name) const
+ {
+     return _userVars.value(name);
+diff --git a/src/session/Session.h b/src/session/Session.h
+index 0c841fb..92c6cd9 100644
+--- a/src/session/Session.h
++++ b/src/session/Session.h
+@@ -849,6 +849,13 @@ public Q_SLOTS:
+     Q_SCRIPTABLE QString tabColor() const;
+     Q_SCRIPTABLE void setTabColor(const QString &colorName);
+ 
++    /**
++     * A colored dot shown as the session's tab icon, for plugins that track
++     * what the session's program is doing. An invalid color removes it.
++     */
++    QColor statusIndicator() const;
++    void setStatusIndicator(const QColor &color);
++
+     /**
+      * Sets/gets a user-defined variable, as set by programs with the
+      * escape sequence OSC 1337 ; SetUserVar=<name>=<base64 value>.
+@@ -1087,6 +1094,7 @@ private:
+     bool _tabActivityColorSetByUser = false;
+ 
+     QHash<QString, QString> _userVars;
++    QColor _statusIndicator;
+ 
+     // Badge properties
+     bool _badgeEnabled = false;
+diff --git a/src/session/SessionController.cpp b/src/session/SessionController.cpp
+index 157d6b0..e1b45a2 100644
+--- a/src/session/SessionController.cpp
++++ b/src/session/SessionController.cpp
+@@ -2043,6 +2043,8 @@ bool SessionController::isCopyInputActive() const
+ 
+ void SessionController::sessionAttributeChanged()
+ {
++    setStatusIndicator(session()->statusIndicator());
++
+     if (_sessionIconName != session()->iconName()) {
+         qCDebug(KonsoleDebug) << "sessionAttributeChanged: TP 1.1";
+         updateSessionIcon();
+diff --git a/src/widgets/ViewContainer.cpp b/src/widgets/ViewContainer.cpp
+index 26732c1..a00101d 100644
+--- a/src/widgets/ViewContainer.cpp
++++ b/src/widgets/ViewContainer.cpp
+@@ -15,6 +15,7 @@
+ #include <QKeyEvent>
+ #include <QLabel>
+ #include <QMenu>
++#include <QPainter>
+ #include <QTabBar>
+ 
+ // KDE
+@@ -738,6 +739,31 @@ QColor TabbedViewContainer::effectiveTabActivityColor(ViewSplitter *splitter) co
+     return mixed ? QColor() : chosen;
+ }
+ 
++// A dot of the given color, for the tab of a session that shows a status.
++static QIcon statusDotIcon(const QColor &color)
++{
++    static QHash<QRgb, QIcon> cache;
++    const auto cached = cache.constFind(color.rgba());
++    if (cached != cache.cend()) {
++        return *cached;
++    }
++    QIcon icon;
++    for (const int size : {16, 22, 32, 48}) {
++        QPixmap pixmap(size, size);
++        pixmap.fill(Qt::transparent);
++        QPainter painter(&pixmap);
++        painter.setRenderHint(QPainter::Antialiasing);
++        const qreal diameter = size * 0.5;
++        painter.setPen(QPen(color.darker(140), size / 16.0));
++        painter.setBrush(color);
++        painter.drawEllipse(QRectF((size - diameter) / 2, (size - diameter) / 2, diameter, diameter));
++        painter.end();
++        icon.addPixmap(pixmap);
++    }
++    cache.insert(color.rgba(), icon);
++    return icon;
++}
++
+ void TabbedViewContainer::updateIcon(ViewProperties *item)
+ {
+     auto controller = qobject_cast<SessionController *>(item);
+@@ -754,7 +780,8 @@ void TabbedViewContainer::updateIcon(ViewProperties *item)
+     //      focus changes or when the Session clears its notifications
+     // 2. Copy input or read-only indicator when all views in the tab have
+     //    the status
+-    // 3. Active view icon
++    // 3. Status dot of the view
++    // 4. Active view icon
+ 
+     QIcon icon = item->icon();
+     if (state.notification != Session::NoNotification) {
+@@ -779,9 +806,12 @@ void TabbedViewContainer::updateIcon(ViewProperties *item)
+         icon = QIcon::fromTheme(QLatin1String("irc-voice"));
+     } else if (state.readOnly) {
+         icon = QIcon::fromTheme(QLatin1String("object-locked"));
++    } else if (item->statusIndicator().isValid()) {
++        icon = statusDotIcon(item->statusIndicator());
+     }
+ 
+-    if (tabIcon(index).name() != icon.name()) {
++    // A drawn icon has no name, so compare those by cache key.
++    if (tabIcon(index).name() != icon.name() || (icon.name().isEmpty() && tabIcon(index).cacheKey() != icon.cacheKey())) {
+         setTabIcon(index, icon);
+     }
+ }
+-- 
+2.56.0
+

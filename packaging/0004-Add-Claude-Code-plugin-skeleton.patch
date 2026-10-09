@@ -1,0 +1,354 @@
+From 16682f0771a089fcfdc11884556e7b64862a58d1 Mon Sep 17 00:00:00 2001
+From: Eric Duprey <509630+destinal@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 13:13:56 -0700
+Subject: [PATCH 04/17] Add Claude Code plugin skeleton
+
+A plugin that will show the status of Claude Code sessions, modeled on
+iTerm2's Claude Code integration. This first version only proves the
+pieces load:
+
+- a "Claude Sessions" panel docked on the right, empty for now, toggled
+  with Plugins > Show Claude Sessions (Ctrl+Shift+F3);
+- a D-Bus object at /ClaudeCode on Konsole's service, interface
+  org.kde.konsole.ClaudeCode, with ping() returning the plugin version
+  and sessions() listing the session paths the plugin sees.
+
+The plugin needs D-Bus and is built when ENABLE_PLUGIN_CLAUDECODE is on
+(the default).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                                |  1 +
+ src/plugins/CMakeLists.txt                    |  3 +
+ src/plugins/ClaudeCode/CMakeLists.txt         | 16 +++++
+ src/plugins/ClaudeCode/claudecodedbus.cpp     | 36 ++++++++++
+ src/plugins/ClaudeCode/claudecodedbus.h       | 34 +++++++++
+ src/plugins/ClaudeCode/claudecodeplugin.cpp   | 71 +++++++++++++++++++
+ src/plugins/ClaudeCode/claudecodeplugin.h     | 34 +++++++++
+ .../ClaudeCode/claudesessionswidget.cpp       | 22 ++++++
+ src/plugins/ClaudeCode/claudesessionswidget.h | 21 ++++++
+ .../ClaudeCode/konsole_claudecode.in.json     |  6 ++
+ 10 files changed, 244 insertions(+)
+ create mode 100644 src/plugins/ClaudeCode/CMakeLists.txt
+ create mode 100644 src/plugins/ClaudeCode/claudecodedbus.cpp
+ create mode 100644 src/plugins/ClaudeCode/claudecodedbus.h
+ create mode 100644 src/plugins/ClaudeCode/claudecodeplugin.cpp
+ create mode 100644 src/plugins/ClaudeCode/claudecodeplugin.h
+ create mode 100644 src/plugins/ClaudeCode/claudesessionswidget.cpp
+ create mode 100644 src/plugins/ClaudeCode/claudesessionswidget.h
+ create mode 100644 src/plugins/ClaudeCode/konsole_claudecode.in.json
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 85a51e3..77e669f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -146,6 +146,7 @@ file(GLOB ICONS_SRCS "data/icons/*.png")
+ 
+ option(ENABLE_PLUGIN_SSHMANAGER "Build the SSHManager plugin" ON)
+ option(ENABLE_PLUGIN_QUICKCOMMANDS "Build the Quick Commands plugin" ON)
++option(ENABLE_PLUGIN_CLAUDECODE "Build the Claude Code plugin" ON)
+ 
+ add_subdirectory( src )
+ add_subdirectory( desktop )
+diff --git a/src/plugins/CMakeLists.txt b/src/plugins/CMakeLists.txt
+index dc64608..72f258a 100644
+--- a/src/plugins/CMakeLists.txt
++++ b/src/plugins/CMakeLists.txt
+@@ -4,3 +4,6 @@ endif()
+ if(ENABLE_PLUGIN_QUICKCOMMANDS)
+     add_subdirectory(QuickCommands)
+ endif()
++if(ENABLE_PLUGIN_CLAUDECODE AND HAVE_DBUS)
++    add_subdirectory(ClaudeCode)
++endif()
+diff --git a/src/plugins/ClaudeCode/CMakeLists.txt b/src/plugins/ClaudeCode/CMakeLists.txt
+new file mode 100644
+index 0000000..0a051a3
+--- /dev/null
++++ b/src/plugins/ClaudeCode/CMakeLists.txt
+@@ -0,0 +1,16 @@
++kcoreaddons_add_plugin(konsole_claudecodeplugin
++SOURCES
++    claudecodeplugin.cpp
++    claudecodedbus.cpp
++    claudesessionswidget.cpp
++INSTALL_NAMESPACE
++    "konsoleplugins"
++)
++
++configure_file(konsole_claudecode.in.json konsole_claudecode.json)
++target_link_libraries(konsole_claudecodeplugin
++    konsoleprivate
++    konsoleapp
++    Qt::DBus
++)
++target_compile_definitions(konsole_claudecodeplugin PRIVATE -DRELEASE_SERVICE_VERSION="${RELEASE_SERVICE_VERSION}")
+diff --git a/src/plugins/ClaudeCode/claudecodedbus.cpp b/src/plugins/ClaudeCode/claudecodedbus.cpp
+new file mode 100644
+index 0000000..ba75cac
+--- /dev/null
++++ b/src/plugins/ClaudeCode/claudecodedbus.cpp
+@@ -0,0 +1,36 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "claudecodedbus.h"
++
++#include "session/Session.h"
++#include "session/SessionManager.h"
++
++#include <QDBusConnection>
++
++ClaudeCodeDBus::ClaudeCodeDBus(QObject *parent)
++    : QObject(parent)
++{
++}
++
++bool ClaudeCodeDBus::registerObject()
++{
++    return QDBusConnection::sessionBus().registerObject(QStringLiteral("/ClaudeCode"), this, QDBusConnection::ExportAllSlots);
++}
++
++QString ClaudeCodeDBus::ping() const
++{
++    return QStringLiteral(RELEASE_SERVICE_VERSION);
++}
++
++QStringList ClaudeCodeDBus::sessions() const
++{
++    QStringList paths;
++    const auto sessions = Konsole::SessionManager::instance()->sessions();
++    for (const Konsole::Session *session : sessions) {
++        paths.append(QStringLiteral("/Sessions/%1").arg(session->sessionId()));
++    }
++    return paths;
++}
++
++#include "moc_claudecodedbus.cpp"
+diff --git a/src/plugins/ClaudeCode/claudecodedbus.h b/src/plugins/ClaudeCode/claudecodedbus.h
+new file mode 100644
+index 0000000..9242204
+--- /dev/null
++++ b/src/plugins/ClaudeCode/claudecodedbus.h
+@@ -0,0 +1,34 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#ifndef CLAUDECODEDBUS_H
++#define CLAUDECODEDBUS_H
++
++#include <QObject>
++#include <QStringList>
++
++/**
++ * The plugin's D-Bus object, at /ClaudeCode on Konsole's own service.
++ * Hooks running in a Konsole session reach it through
++ * $KONSOLE_DBUS_SERVICE.
++ */
++class ClaudeCodeDBus : public QObject
++{
++    Q_OBJECT
++    Q_CLASSINFO("D-Bus Interface", "org.kde.konsole.ClaudeCode")
++
++public:
++    explicit ClaudeCodeDBus(QObject *parent);
++
++    /** Registers the object on the session bus. Returns whether it succeeded. */
++    bool registerObject();
++
++public Q_SLOTS:
++    /** Returns the plugin's version, to check that it is loaded. */
++    QString ping() const;
++
++    /** Returns the D-Bus paths of the sessions the plugin sees, such as /Sessions/1. */
++    QStringList sessions() const;
++};
++
++#endif // CLAUDECODEDBUS_H
+diff --git a/src/plugins/ClaudeCode/claudecodeplugin.cpp b/src/plugins/ClaudeCode/claudecodeplugin.cpp
+new file mode 100644
+index 0000000..3014355
+--- /dev/null
++++ b/src/plugins/ClaudeCode/claudecodeplugin.cpp
+@@ -0,0 +1,71 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "claudecodeplugin.h"
++#include "claudecodedbus.h"
++#include "claudesessionswidget.h"
++#include "konsoledebug.h"
++
++#include "MainWindow.h"
++
++#include <KActionCollection>
++#include <KLocalizedString>
++
++#include <QDockWidget>
++
++K_PLUGIN_CLASS_WITH_JSON(ClaudeCodePlugin, "konsole_claudecode.json")
++
++struct ClaudeCodePlugin::Private {
++    QMap<Konsole::MainWindow *, QDockWidget *> dockForWindow;
++};
++
++ClaudeCodePlugin::ClaudeCodePlugin(QObject *object, const QVariantList &args)
++    : Konsole::IKonsolePlugin(object, args)
++    , priv(std::make_unique<Private>())
++{
++    setName(QStringLiteral("ClaudeCode"));
++
++    auto *dbus = new ClaudeCodeDBus(this);
++    if (!dbus->registerObject()) {
++        qCWarning(KonsoleDebug) << "Claude Code plugin could not register /ClaudeCode on D-Bus";
++    }
++}
++
++ClaudeCodePlugin::~ClaudeCodePlugin() = default;
++
++void ClaudeCodePlugin::createWidgetsForMainWindow(Konsole::MainWindow *mainWindow)
++{
++    auto *dock = new QDockWidget(mainWindow);
++    dock->setWindowTitle(i18n("Claude Sessions"));
++    dock->setWidget(new ClaudeSessionsWidget(dock));
++    dock->setObjectName(QStringLiteral("ClaudeCodeDock"));
++    dock->setVisible(false);
++    dock->setAllowedAreas(Qt::DockWidgetArea::LeftDockWidgetArea | Qt::DockWidgetArea::RightDockWidgetArea);
++
++    mainWindow->addDockWidget(Qt::RightDockWidgetArea, dock);
++    priv->dockForWindow[mainWindow] = dock;
++    connect(mainWindow, &QObject::destroyed, this, [this, mainWindow] {
++        priv->dockForWindow.remove(mainWindow);
++    });
++}
++
++void ClaudeCodePlugin::activeViewChanged(Konsole::SessionController *controller, Konsole::MainWindow *mainWindow)
++{
++    Q_UNUSED(controller)
++    Q_UNUSED(mainWindow)
++}
++
++QList<QAction *> ClaudeCodePlugin::menuBarActions(Konsole::MainWindow *mainWindow) const
++{
++    auto *toggleVisibilityAction = new QAction(i18n("Show Claude Sessions"), mainWindow);
++    toggleVisibilityAction->setCheckable(true);
++    mainWindow->actionCollection()->addAction(QStringLiteral("claudecode-show-sessions"), toggleVisibilityAction);
++    mainWindow->actionCollection()->setDefaultShortcut(toggleVisibilityAction, QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_F3));
++    connect(toggleVisibilityAction, &QAction::triggered, priv->dockForWindow[mainWindow], &QDockWidget::setVisible);
++    connect(priv->dockForWindow[mainWindow], &QDockWidget::visibilityChanged, toggleVisibilityAction, &QAction::setChecked);
++
++    return {toggleVisibilityAction};
++}
++
++#include "claudecodeplugin.moc"
++#include "moc_claudecodeplugin.cpp"
+diff --git a/src/plugins/ClaudeCode/claudecodeplugin.h b/src/plugins/ClaudeCode/claudecodeplugin.h
+new file mode 100644
+index 0000000..fae6e30
+--- /dev/null
++++ b/src/plugins/ClaudeCode/claudecodeplugin.h
+@@ -0,0 +1,34 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#ifndef CLAUDECODEPLUGIN_H
++#define CLAUDECODEPLUGIN_H
++
++#include <pluginsystem/IKonsolePlugin.h>
++
++#include <memory>
++
++namespace Konsole
++{
++class SessionController;
++class MainWindow;
++}
++
++class ClaudeCodePlugin : public Konsole::IKonsolePlugin
++{
++    Q_OBJECT
++
++public:
++    ClaudeCodePlugin(QObject *object, const QVariantList &args);
++    ~ClaudeCodePlugin() override;
++
++    void createWidgetsForMainWindow(Konsole::MainWindow *mainWindow) override;
++    void activeViewChanged(Konsole::SessionController *controller, Konsole::MainWindow *mainWindow) override;
++    QList<QAction *> menuBarActions(Konsole::MainWindow *mainWindow) const override;
++
++private:
++    struct Private;
++    std::unique_ptr<Private> priv;
++};
++
++#endif // CLAUDECODEPLUGIN_H
+diff --git a/src/plugins/ClaudeCode/claudesessionswidget.cpp b/src/plugins/ClaudeCode/claudesessionswidget.cpp
+new file mode 100644
+index 0000000..32842cd
+--- /dev/null
++++ b/src/plugins/ClaudeCode/claudesessionswidget.cpp
+@@ -0,0 +1,22 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "claudesessionswidget.h"
++
++#include <KLocalizedString>
++
++#include <QLabel>
++#include <QVBoxLayout>
++
++ClaudeSessionsWidget::ClaudeSessionsWidget(QWidget *parent)
++    : QWidget(parent)
++{
++    auto *placeholder = new QLabel(i18n("No Claude Code sessions"), this);
++    placeholder->setAlignment(Qt::AlignCenter);
++    placeholder->setEnabled(false);
++
++    auto *layout = new QVBoxLayout(this);
++    layout->addWidget(placeholder);
++}
++
++#include "moc_claudesessionswidget.cpp"
+diff --git a/src/plugins/ClaudeCode/claudesessionswidget.h b/src/plugins/ClaudeCode/claudesessionswidget.h
+new file mode 100644
+index 0000000..84e196c
+--- /dev/null
++++ b/src/plugins/ClaudeCode/claudesessionswidget.h
+@@ -0,0 +1,21 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#ifndef CLAUDESESSIONSWIDGET_H
++#define CLAUDESESSIONSWIDGET_H
++
++#include <QWidget>
++
++/**
++ * The Claude Sessions panel: every Claude Code session in Konsole, with
++ * its status. Empty for now.
++ */
++class ClaudeSessionsWidget : public QWidget
++{
++    Q_OBJECT
++
++public:
++    explicit ClaudeSessionsWidget(QWidget *parent = nullptr);
++};
++
++#endif // CLAUDESESSIONSWIDGET_H
+diff --git a/src/plugins/ClaudeCode/konsole_claudecode.in.json b/src/plugins/ClaudeCode/konsole_claudecode.in.json
+new file mode 100644
+index 0000000..201f25f
+--- /dev/null
++++ b/src/plugins/ClaudeCode/konsole_claudecode.in.json
+@@ -0,0 +1,6 @@
++{
++    "KPlugin": {
++        "Name": "Claude Code",
++        "Version": "@RELEASE_SERVICE_VERSION@"
++    }
++}
+-- 
+2.56.0
+

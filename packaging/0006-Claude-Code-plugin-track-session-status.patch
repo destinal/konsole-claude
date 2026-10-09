@@ -1,0 +1,2100 @@
+From dab8003d961d3551ad537f295cb1e3cff1ab58aa Mon Sep 17 00:00:00 2001
+From: Eric Duprey <509630+destinal@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 13:39:33 -0700
+Subject: [PATCH 06/17] Claude Code plugin: track session status
+
+The plugin now keeps a status for every session, set the way iTerm2's
+Claude Code integration sets it, so that iTerm2's own hook, cc-status,
+can drive it unchanged:
+
+- SessionStatus ports iTerm2's status model and its expiration rules: a
+  status may hold only until the program's OSC 9;4 operation ends, gives
+  way to its fallback after a three second head start, and is held back
+  while background work is counted. Preconditions drop an update whole.
+- SessionStatusRegistry tracks every session from creation and feeds it
+  OSC 9;4 progress and OSC 21337 status.
+- The D-Bus object gains setStatus, getStatus and getBackgroundTaskCount,
+  taking iTerm2's set_session_status arguments and answering with the
+  same JSON.
+- it2 is a small command that turns the it2 calls cc-status makes into
+  those D-Bus calls, and claude-code-hook is the hook Claude Code runs:
+  it names the session for cc-status and runs it.
+
+SessionStatusTest ports the status-model tests from iTerm2.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/plugins/ClaudeCode/CMakeLists.txt         |   8 +
+ .../ClaudeCode/autotests/CMakeLists.txt       |  10 +
+ .../autotests/SessionStatusTest.cpp           | 755 ++++++++++++++++++
+ src/plugins/ClaudeCode/claudecodedbus.cpp     |  50 +-
+ src/plugins/ClaudeCode/claudecodedbus.h       |  38 +-
+ src/plugins/ClaudeCode/claudecodeplugin.cpp   |  19 +-
+ src/plugins/ClaudeCode/hook/claude-code-hook  |  25 +
+ src/plugins/ClaudeCode/it2/CMakeLists.txt     |  14 +
+ src/plugins/ClaudeCode/it2/it2.cpp            | 255 ++++++
+ src/plugins/ClaudeCode/sessionstatus.cpp      | 432 ++++++++++
+ src/plugins/ClaudeCode/sessionstatus.h        | 163 ++++
+ .../ClaudeCode/sessionstatusregistry.cpp      |  69 ++
+ .../ClaudeCode/sessionstatusregistry.h        |  49 ++
+ 13 files changed, 1877 insertions(+), 10 deletions(-)
+ create mode 100644 src/plugins/ClaudeCode/autotests/CMakeLists.txt
+ create mode 100644 src/plugins/ClaudeCode/autotests/SessionStatusTest.cpp
+ create mode 100755 src/plugins/ClaudeCode/hook/claude-code-hook
+ create mode 100644 src/plugins/ClaudeCode/it2/CMakeLists.txt
+ create mode 100644 src/plugins/ClaudeCode/it2/it2.cpp
+ create mode 100644 src/plugins/ClaudeCode/sessionstatus.cpp
+ create mode 100644 src/plugins/ClaudeCode/sessionstatus.h
+ create mode 100644 src/plugins/ClaudeCode/sessionstatusregistry.cpp
+ create mode 100644 src/plugins/ClaudeCode/sessionstatusregistry.h
+
+diff --git a/src/plugins/ClaudeCode/CMakeLists.txt b/src/plugins/ClaudeCode/CMakeLists.txt
+index 0a051a3..6f9f6eb 100644
+--- a/src/plugins/ClaudeCode/CMakeLists.txt
++++ b/src/plugins/ClaudeCode/CMakeLists.txt
+@@ -3,6 +3,8 @@ SOURCES
+     claudecodeplugin.cpp
+     claudecodedbus.cpp
+     claudesessionswidget.cpp
++    sessionstatus.cpp
++    sessionstatusregistry.cpp
+ INSTALL_NAMESPACE
+     "konsoleplugins"
+ )
+@@ -14,3 +16,9 @@ target_link_libraries(konsole_claudecodeplugin
+     Qt::DBus
+ )
+ target_compile_definitions(konsole_claudecodeplugin PRIVATE -DRELEASE_SERVICE_VERSION="${RELEASE_SERVICE_VERSION}")
++
++add_subdirectory(it2)
++
++if(BUILD_TESTING)
++    add_subdirectory(autotests)
++endif()
+diff --git a/src/plugins/ClaudeCode/autotests/CMakeLists.txt b/src/plugins/ClaudeCode/autotests/CMakeLists.txt
+new file mode 100644
+index 0000000..6105931
+--- /dev/null
++++ b/src/plugins/ClaudeCode/autotests/CMakeLists.txt
+@@ -0,0 +1,10 @@
++include(ECMAddTests)
++
++ecm_add_test(
++    SessionStatusTest.cpp
++    ../sessionstatus.cpp
++    ../sessionstatus.h
++    TEST_NAME ClaudeCodeSessionStatusTest
++    LINK_LIBRARIES Qt::Test konsoleprivate
++)
++target_include_directories(ClaudeCodeSessionStatusTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+diff --git a/src/plugins/ClaudeCode/autotests/SessionStatusTest.cpp b/src/plugins/ClaudeCode/autotests/SessionStatusTest.cpp
+new file mode 100644
+index 0000000..7ba25b7
+--- /dev/null
++++ b/src/plugins/ClaudeCode/autotests/SessionStatusTest.cpp
+@@ -0,0 +1,755 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// Ports the status-model tests of iTerm2 (SetStatusBuiltInFunctionTests,
++// SessionTabStatusBackgroundTasksTests, TabStatusControllerTests), so the
++// plugin behaves the way cc-status expects iTerm2 to.
++
++#include "sessionstatus.h"
++
++#include <QJsonDocument>
++#include <QSignalSpy>
++#include <QTest>
++
++#include <limits>
++
++using Konsole::TabStatusFields;
++using Konsole::TerminalProgress;
++
++namespace
++{
++// Short enough to keep the tests fast, long enough to land updates inside.
++constexpr int delay = 30;
++
++const std::optional<TerminalProgress> indeterminate = TerminalProgress{TerminalProgress::Indeterminate, 0};
++const std::optional<TerminalProgress> stopped = std::nullopt;
++
++StatusUpdate working(bool expiring)
++{
++    StatusUpdate update;
++    update.fields.status = QStringLiteral("working");
++    if (expiring) {
++        update.expiresOnProgressEnd = true;
++        update.fallback.status = QStringLiteral("idle");
++    }
++    return update;
++}
++
++StatusUpdate withStatus(const QString &status)
++{
++    StatusUpdate update;
++    update.fields.status = status;
++    return update;
++}
++
++StatusUpdate bookkeeping(qint64 count)
++{
++    StatusUpdate update;
++    update.backgroundTasks = count;
++    return update;
++}
++
++StatusUpdate delta(qint64 value)
++{
++    StatusUpdate update;
++    update.backgroundTasksDelta = value;
++    return update;
++}
++
++StatusUpdate turnOpen(bool open)
++{
++    StatusUpdate update;
++    update.turnOpen = open;
++    return update;
++}
++
++void endOperation(SessionStatus &status)
++{
++    status.progressReported(indeterminate);
++    status.progressReported(stopped);
++}
++
++void settle()
++{
++    QTest::qWait(delay * 4);
++}
++
++std::optional<StatusUpdate> parse(const QVariantMap &arguments, QString *error = nullptr)
++{
++    QString ignored;
++    return StatusUpdate::fromArguments(arguments, error != nullptr ? error : &ignored);
++}
++
++QString text(const SessionStatus &status)
++{
++    return status.statusText().value_or(QStringLiteral("<none>"));
++}
++}
++
++class SessionStatusTest : public QObject
++{
++    Q_OBJECT
++
++private Q_SLOTS:
++    // Arguments, as it2 set-status passes them.
++    void testTurnOpenArgument();
++    void testDeltaArgument();
++    void testCountAndDeltaTogetherAreRefused();
++    void testNegativeCountIsClamped();
++    void testPreconditionArguments();
++    void testInvalidColorsAreRefused();
++    void testEmptyArgumentsClearAndMissingOnesLeaveAlone();
++    void testExpiresOnArguments();
++
++    // The JSON answer.
++    void testJsonBeforeAnyStatus();
++    void testJsonCarriesEveryField();
++
++    // Background-task count and turn flag.
++    void testCountIsBookkeeping();
++    void testDeltaAddsAndClamps();
++    void testDeltaSaturates();
++    void testTurnFlag();
++
++    // Preconditions.
++    void testPreconditionsDropTheWholeUpdate();
++    void testUnknownTurnFailsEitherPrecondition();
++    void testPreconditionsThatHoldApply();
++    void testDroppedUpdateLeavesTheExpirationArmed();
++
++    // Expiring at the end of an operation.
++    void testOperationEndExpiresTheStatus();
++    void testProgressOnlySessionHasNoStatus();
++    void testStopWithoutStartDoesNothing();
++    void testAssertionDuringTheHeadStartWins();
++    void testProgressResumingDuringTheHeadStartCancels();
++    void testErrorEndsTheOperation();
++    void testPausedDoesNotEndTheOperation();
++    void testAssertionWithoutExpirationDisarms();
++    void testLaterAssertionRearmsWithItsOwnFallback();
++    void testArmingWithoutVisibleChange();
++    void testBookkeepingDoesNotDisarm();
++    void testExpirationIsNotReused();
++    void testFallbackWithNoFieldsClears();
++
++    // Background work holding an expiration.
++    void testBackgroundWorkHoldsThenReleases();
++    void testCountInsideTheHeadStartDoesNotCutItShort();
++    void testReassertingWhileHeldKeepsTheCountAbleToRelease();
++    void testReassertingWhileHeldWithoutExpirationDisarms();
++    void testDeltaReachingZeroReleases();
++    void testBookkeepingDoesNotReleaseANewTurn();
++
++    // Lifecycle and key presses.
++    void testClearSupersedesAPendingExpiration();
++    void testProgramExitDropsEverything();
++    void testAfterExitAStopCannotEndAnUnseenOperation();
++    void testChangesCarryThePreviousText();
++    void testKeyPressTurnsDoneAndErrorIdle();
++    void testKeyPressLeavesOtherStatusesAlone();
++
++    // OSC 21337.
++    void testTabStatusUpdateConverts();
++};
++
++void SessionStatusTest::testTurnOpenArgument()
++{
++    QCOMPARE(parse({{QStringLiteral("turn_open"), true}})->turnOpen, std::optional<bool>(true));
++    QCOMPARE(parse({{QStringLiteral("turn_open"), false}})->turnOpen, std::optional<bool>(false));
++    const auto update = parse({{QStringLiteral("status"), QStringLiteral("working")}});
++    QVERIFY(!update->turnOpen.has_value());
++    QCOMPARE(update->fields.status, QStringLiteral("working"));
++}
++
++void SessionStatusTest::testDeltaArgument()
++{
++    const auto update = parse({{QStringLiteral("background_tasks_delta"), -1}});
++    QVERIFY(!update->backgroundTasks.has_value());
++    QCOMPARE(update->backgroundTasksDelta, std::optional<qint64>(-1));
++}
++
++void SessionStatusTest::testCountAndDeltaTogetherAreRefused()
++{
++    QString error;
++    QVERIFY(!parse({{QStringLiteral("background_tasks"), 2}, {QStringLiteral("background_tasks_delta"), 1}}, &error).has_value());
++    QCOMPARE(error, QStringLiteral("Pass background_tasks or background_tasks_delta, not both."));
++}
++
++void SessionStatusTest::testNegativeCountIsClamped()
++{
++    QCOMPARE(parse({{QStringLiteral("background_tasks"), -3}})->backgroundTasks, std::optional<qint64>(0));
++}
++
++void SessionStatusTest::testPreconditionArguments()
++{
++    const auto update =
++        parse({{QStringLiteral("status"), QStringLiteral("idle")}, {QStringLiteral("if_turn_open"), false}, {QStringLiteral("if_background_tasks"), 0}});
++    QCOMPARE(update->requiredTurnOpen, std::optional<bool>(false));
++    QCOMPARE(update->requiredBackgroundTasks, std::optional<qint64>(0));
++
++    const auto none = parse({{QStringLiteral("status"), QStringLiteral("idle")}});
++    QVERIFY(!none->requiredTurnOpen.has_value());
++    QVERIFY(!none->requiredBackgroundTasks.has_value());
++}
++
++void SessionStatusTest::testInvalidColorsAreRefused()
++{
++    QString error;
++    QVERIFY(!parse({{QStringLiteral("dot_color"), QStringLiteral("orange")}}, &error).has_value());
++    QCOMPARE(error, QStringLiteral("Invalid dot_color (expected #rrggbb)"));
++    QVERIFY(!parse({{QStringLiteral("text_color"), QStringLiteral("#12")}}, &error).has_value());
++    QCOMPARE(error, QStringLiteral("Invalid text_color (expected #rrggbb)"));
++    QVERIFY(!parse({{QStringLiteral("expires_on"), QStringLiteral("progress-end")}, {QStringLiteral("then_dot_color"), QStringLiteral("nope")}}, &error)
++                 .has_value());
++    QCOMPARE(error, QStringLiteral("Invalid then_dot_color (expected #rrggbb)"));
++
++    const auto update = parse({{QStringLiteral("dot_color"), QStringLiteral("#ff9500")}, {QStringLiteral("text_color"), QStringLiteral("#888")}});
++    QCOMPARE(update->fields.indicator->name(), QStringLiteral("#ff9500"));
++    QCOMPARE(update->fields.statusColor->name(), QStringLiteral("#888888"));
++}
++
++void SessionStatusTest::testEmptyArgumentsClearAndMissingOnesLeaveAlone()
++{
++    const auto update = parse({{QStringLiteral("status"), QString()},
++                               {QStringLiteral("dot_color"), QString()},
++                               {QStringLiteral("text_color"), QString()},
++                               {QStringLiteral("detail"), QString()}});
++    QCOMPARE(update->fields, TabStatusFields::cleared());
++    QCOMPARE(parse({})->fields, TabStatusFields());
++}
++
++void SessionStatusTest::testExpiresOnArguments()
++{
++    // Without then_ arguments the status is cleared when it expires.
++    auto update = parse({{QStringLiteral("status"), QStringLiteral("working")}, {QStringLiteral("expires_on"), QStringLiteral("progress-end")}});
++    QVERIFY(update->expiresOnProgressEnd);
++    QCOMPARE(update->fallback, TabStatusFields::cleared());
++
++    update = parse({{QStringLiteral("expires_on"), QStringLiteral("progress-end")},
++                    {QStringLiteral("then_status"), QStringLiteral("idle")},
++                    {QStringLiteral("then_dot_color"), QStringLiteral("#00d75f")},
++                    {QStringLiteral("then_detail"), QString()}});
++    QCOMPARE(update->fallback.status, QStringLiteral("idle"));
++    QCOMPARE(update->fallback.indicator->name(), QStringLiteral("#00d75f"));
++    QCOMPARE(update->fallback.detail, QString());
++    QVERIFY(!update->fallback.statusColor.has_value());
++
++    // An empty expires_on means no expiration.
++    QVERIFY(!parse({{QStringLiteral("expires_on"), QString()}})->expiresOnProgressEnd);
++
++    QString error;
++    QVERIFY(!parse({{QStringLiteral("expires_on"), QStringLiteral("tomorrow")}}, &error).has_value());
++    QVERIFY(error.startsWith(QStringLiteral("Unknown expires_on")));
++    QVERIFY(!parse({{QStringLiteral("then_status"), QStringLiteral("idle")}}, &error).has_value());
++    QCOMPARE(error, QStringLiteral("The then_ arguments only mean something with expires_on, which was not given."));
++}
++
++void SessionStatusTest::testJsonBeforeAnyStatus()
++{
++    SessionStatus status;
++    const QJsonObject json = status.toJson();
++    QCOMPARE(json.keys(),
++             (QStringList{QStringLiteral("background_tasks"),
++                          QStringLiteral("detail"),
++                          QStringLiteral("dot_color"),
++                          QStringLiteral("status"),
++                          QStringLiteral("text_color"),
++                          QStringLiteral("turn_open")}));
++    QCOMPARE(json.value(QStringLiteral("background_tasks")).toInteger(), 0);
++    for (const char *key : {"status", "text_color", "dot_color", "detail", "turn_open"}) {
++        QVERIFY2(json.value(QLatin1String(key)).isNull(), key);
++    }
++}
++
++void SessionStatusTest::testJsonCarriesEveryField()
++{
++    SessionStatus status;
++    StatusUpdate update = withStatus(QStringLiteral("working"));
++    update.fields.detail = QStringLiteral("1 background task running");
++    update.fields.indicator = QColor(QStringLiteral("#ff9500"));
++    update.backgroundTasks = 1;
++    update.turnOpen = false;
++    status.apply(update);
++
++    const QString json = QString::fromUtf8(QJsonDocument(status.toJson()).toJson(QJsonDocument::Compact));
++    QVERIFY(json.contains(QStringLiteral("\"turn_open\":false")));
++    QVERIFY(json.contains(QStringLiteral("\"status\":\"working\"")));
++    QVERIFY(json.contains(QStringLiteral("\"detail\":\"1 background task running\"")));
++    QVERIFY(json.contains(QStringLiteral("\"background_tasks\":1")));
++    QVERIFY(json.contains(QStringLiteral("\"dot_color\":\"#ff9500\"")));
++    QVERIFY(json.contains(QStringLiteral("\"text_color\":null")));
++}
++
++void SessionStatusTest::testCountIsBookkeeping()
++{
++    SessionStatus status;
++    QSignalSpy changed(&status, &SessionStatus::changed);
++    status.apply(bookkeeping(3));
++    QCOMPARE(status.backgroundTasks(), 3);
++    QCOMPARE(changed.count(), 0);
++
++    StatusUpdate visible = bookkeeping(3);
++    visible.fields.status = QStringLiteral("working");
++    status.apply(visible);
++    QCOMPARE(changed.count(), 1);
++
++    // An update without a count leaves it alone.
++    status.apply(withStatus(QStringLiteral("idle")));
++    QCOMPARE(status.backgroundTasks(), 3);
++}
++
++void SessionStatusTest::testDeltaAddsAndClamps()
++{
++    SessionStatus status;
++    status.apply(delta(1));
++    status.apply(delta(1));
++    status.apply(delta(-1));
++    QCOMPARE(status.backgroundTasks(), 1);
++    status.apply(delta(-5));
++    QCOMPARE(status.backgroundTasks(), 0);
++}
++
++void SessionStatusTest::testDeltaSaturates()
++{
++    SessionStatus status;
++    status.apply(bookkeeping(1));
++    status.apply(delta(std::numeric_limits<qint64>::max()));
++    QCOMPARE(status.backgroundTasks(), std::numeric_limits<qint64>::max());
++    status.apply(delta(std::numeric_limits<qint64>::min()));
++    QCOMPARE(status.backgroundTasks(), 0);
++    status.apply(delta(std::numeric_limits<qint64>::min()));
++    QCOMPARE(status.backgroundTasks(), 0);
++}
++
++void SessionStatusTest::testTurnFlag()
++{
++    SessionStatus status;
++    QSignalSpy changed(&status, &SessionStatus::changed);
++    QVERIFY(!status.turnOpen().has_value());
++    status.apply(turnOpen(true));
++    QCOMPARE(status.turnOpen(), std::optional<bool>(true));
++    // Unrelated updates leave it alone; it never counts as a visible change.
++    status.apply(delta(1));
++    QCOMPARE(status.turnOpen(), std::optional<bool>(true));
++    status.apply(turnOpen(false));
++    QCOMPARE(status.turnOpen(), std::optional<bool>(false));
++    QCOMPARE(changed.count(), 0);
++}
++
++void SessionStatusTest::testPreconditionsDropTheWholeUpdate()
++{
++    SessionStatus status;
++    StatusUpdate start = working(false);
++    start.turnOpen = true;
++    status.apply(start);
++
++    StatusUpdate idle = withStatus(QStringLiteral("idle"));
++    idle.fields.detail = QStringLiteral("DONE");
++    idle.requiredTurnOpen = false;
++    QVERIFY(!status.apply(idle));
++    QCOMPARE(text(status), QStringLiteral("working"));
++    QVERIFY(!status.detail().has_value());
++
++    // The bookkeeping in a dropped update is dropped too.
++    StatusUpdate bookkept = delta(1);
++    bookkept.turnOpen = false;
++    bookkept.requiredTurnOpen = false;
++    QVERIFY(!status.apply(bookkept));
++    QCOMPARE(status.backgroundTasks(), 0);
++    QCOMPARE(status.turnOpen(), std::optional<bool>(true));
++
++    SessionStatus counted;
++    counted.apply(bookkeeping(1));
++    StatusUpdate whenIdle = withStatus(QStringLiteral("idle"));
++    whenIdle.requiredBackgroundTasks = 0;
++    QVERIFY(!counted.apply(whenIdle));
++    QVERIFY(!counted.statusText().has_value());
++}
++
++void SessionStatusTest::testUnknownTurnFailsEitherPrecondition()
++{
++    SessionStatus status;
++    StatusUpdate update = withStatus(QStringLiteral("idle"));
++    update.requiredTurnOpen = false;
++    QVERIFY(!status.apply(update));
++    update.requiredTurnOpen = true;
++    QVERIFY(!status.apply(update));
++    QVERIFY(!status.statusText().has_value());
++}
++
++void SessionStatusTest::testPreconditionsThatHoldApply()
++{
++    SessionStatus status;
++    StatusUpdate start = working(false);
++    start.turnOpen = false;
++    status.apply(start);
++    StatusUpdate idle = withStatus(QStringLiteral("idle"));
++    idle.requiredTurnOpen = false;
++    idle.requiredBackgroundTasks = 0;
++    QVERIFY(status.apply(idle));
++    QCOMPARE(text(status), QStringLiteral("idle"));
++}
++
++void SessionStatusTest::testDroppedUpdateLeavesTheExpirationArmed()
++{
++    SessionStatus status(nullptr, delay);
++    status.apply(working(true));
++    StatusUpdate idle = withStatus(QStringLiteral("idle"));
++    idle.requiredTurnOpen = false;
++    QVERIFY(!status.apply(idle));
++    QVERIFY(status.hasArmedExpiration());
++    endOperation(status);
++    settle();
++    QCOMPARE(text(status), QStringLiteral("idle"));
++}
++
++void SessionStatusTest::testOperationEndExpiresTheStatus()
++{
++    SessionStatus status(nullptr, delay);
++    status.apply(working(true));
++    endOperation(status);
++    // Nothing happens before the head start elapses.
++    QCOMPARE(text(status), QStringLiteral("working"));
++    settle();
++    QCOMPARE(text(status), QStringLiteral("idle"));
++}
++
++void SessionStatusTest::testProgressOnlySessionHasNoStatus()
++{
++    SessionStatus status(nullptr, delay);
++    QSignalSpy changed(&status, &SessionStatus::changed);
++    endOperation(status);
++    settle();
++    QVERIFY(!status.hasActiveStatus());
++    QVERIFY(!status.hasArmedExpiration());
++    QCOMPARE(changed.count(), 0);
++}
++
++void SessionStatusTest::testStopWithoutStartDoesNothing()
++{
++    SessionStatus status(nullptr, delay);
++    status.apply(working(true));
++    status.progressReported(stopped);
++    settle();
++    QCOMPARE(text(status), QStringLiteral("working"));
++    QVERIFY(status.hasArmedExpiration());
++}
++
++void SessionStatusTest::testAssertionDuringTheHeadStartWins()
++{
++    SessionStatus status(nullptr, delay);
++    status.apply(working(true));
++    endOperation(status);
++    status.apply(withStatus(QStringLiteral("waiting")));
++    settle();
++    QCOMPARE(text(status), QStringLiteral("waiting"));
++    QVERIFY(!status.hasArmedExpiration());
++}
++
++void SessionStatusTest::testProgressResumingDuringTheHeadStartCancels()
++{
++    SessionStatus status(nullptr, delay);
++    status.apply(working(true));
++    endOperation(status);
++    status.progressReported(indeterminate);
++    settle();
++    QCOMPARE(text(status), QStringLiteral("working"));
++    QVERIFY(status.hasArmedExpiration());
++    // The expiration waits for the next end.
++    status.progressReported(stopped);
++    settle();
++    QCOMPARE(text(status), QStringLiteral("idle"));
++}
++
++void SessionStatusTest::testErrorEndsTheOperation()
++{
++    for (int percent : {0, 50}) {
++        SessionStatus status(nullptr, delay);
++        status.apply(working(true));
++        status.progressReported(indeterminate);
++        status.progressReported(TerminalProgress{TerminalProgress::Error, percent});
++        settle();
++        QCOMPARE(text(status), QStringLiteral("idle"));
++    }
++}
++
++void SessionStatusTest::testPausedDoesNotEndTheOperation()
++{
++    SessionStatus status(nullptr, delay);
++    status.apply(working(true));
++    status.progressReported(indeterminate);
++    status.progressReported(TerminalProgress{TerminalProgress::Paused, 50});
++    status.progressReported(TerminalProgress{TerminalProgress::Normal, 70});
++    settle();
++    QCOMPARE(text(status), QStringLiteral("working"));
++}
++
++void SessionStatusTest::testAssertionWithoutExpirationDisarms()
++{
++    SessionStatus status(nullptr, delay);
++    status.apply(working(true));
++    QVERIFY(status.hasArmedExpiration());
++    status.apply(working(false));
++    QVERIFY(!status.hasArmedExpiration());
++    endOperation(status);
++    settle();
++    QCOMPARE(text(status), QStringLiteral("working"));
++}
++
++void SessionStatusTest::testLaterAssertionRearmsWithItsOwnFallback()
++{
++    SessionStatus status(nullptr, delay);
++    status.apply(working(true));
++    StatusUpdate waiting = withStatus(QStringLiteral("waiting"));
++    waiting.expiresOnProgressEnd = true;
++    waiting.fallback.status = QStringLiteral("done");
++    status.apply(waiting);
++    endOperation(status);
++    settle();
++    QCOMPARE(text(status), QStringLiteral("done"));
++}
++
++void SessionStatusTest::testArmingWithoutVisibleChange()
++{
++    SessionStatus status(nullptr, delay);
++    status.apply(working(false));
++    QSignalSpy changed(&status, &SessionStatus::changed);
++    status.apply(working(true));
++    QCOMPARE(changed.count(), 0);
++    QVERIFY(status.hasArmedExpiration());
++    endOperation(status);
++    settle();
++    QCOMPARE(text(status), QStringLiteral("idle"));
++
++    // An expiration needs no visible field at all.
++    SessionStatus bare(nullptr, delay);
++    StatusUpdate update;
++    update.expiresOnProgressEnd = true;
++    update.fallback = TabStatusFields::cleared();
++    bare.apply(update);
++    QVERIFY(!bare.hasActiveStatus());
++    QVERIFY(bare.hasArmedExpiration());
++}
++
++void SessionStatusTest::testBookkeepingDoesNotDisarm()
++{
++    SessionStatus status(nullptr, delay);
++    status.apply(working(true));
++    status.apply(bookkeeping(3));
++    QVERIFY(status.hasArmedExpiration());
++    QCOMPARE(status.backgroundTasks(), 3);
++    QVERIFY(!bookkeeping(1).assertsStatus());
++    QVERIFY(working(false).assertsStatus());
++}
++
++void SessionStatusTest::testExpirationIsNotReused()
++{
++    SessionStatus status(nullptr, delay);
++    status.apply(working(true));
++    endOperation(status);
++    settle();
++    QCOMPARE(text(status), QStringLiteral("idle"));
++    QVERIFY(!status.hasArmedExpiration());
++    status.apply(withStatus(QStringLiteral("busy")));
++    endOperation(status);
++    settle();
++    QCOMPARE(text(status), QStringLiteral("busy"));
++}
++
++void SessionStatusTest::testFallbackWithNoFieldsClears()
++{
++    SessionStatus status(nullptr, delay);
++    StatusUpdate update = working(false);
++    update.fields.indicator = QColor(Qt::red);
++    update.expiresOnProgressEnd = true;
++    update.fallback = TabStatusFields::cleared();
++    status.apply(update);
++    endOperation(status);
++    settle();
++    QVERIFY(!status.statusText().has_value());
++    QVERIFY(!status.hasActiveStatus());
++}
++
++void SessionStatusTest::testBackgroundWorkHoldsThenReleases()
++{
++    SessionStatus status(nullptr, delay);
++    StatusUpdate update = working(true);
++    update.backgroundTasks = 2;
++    status.apply(update);
++    endOperation(status);
++    settle();
++    QCOMPARE(text(status), QStringLiteral("working"));
++    // The count reaching zero releases it at once.
++    status.apply(bookkeeping(0));
++    QCOMPARE(text(status), QStringLiteral("idle"));
++}
++
++void SessionStatusTest::testCountInsideTheHeadStartDoesNotCutItShort()
++{
++    SessionStatus status(nullptr, 3600 * 1000);
++    StatusUpdate update = working(true);
++    update.backgroundTasks = 2;
++    status.apply(update);
++    endOperation(status);
++    status.apply(bookkeeping(0));
++    QCOMPARE(text(status), QStringLiteral("working"));
++    QVERIFY(status.hasArmedExpiration());
++}
++
++void SessionStatusTest::testReassertingWhileHeldKeepsTheCountAbleToRelease()
++{
++    SessionStatus status(nullptr, delay);
++    StatusUpdate update = working(true);
++    update.backgroundTasks = 2;
++    status.apply(update);
++    endOperation(status);
++    settle();
++    update.backgroundTasks = 1;
++    status.apply(update);
++    QCOMPARE(text(status), QStringLiteral("working"));
++    status.apply(bookkeeping(0));
++    QCOMPARE(text(status), QStringLiteral("idle"));
++}
++
++void SessionStatusTest::testReassertingWhileHeldWithoutExpirationDisarms()
++{
++    SessionStatus status(nullptr, delay);
++    StatusUpdate update = working(true);
++    update.backgroundTasks = 2;
++    status.apply(update);
++    endOperation(status);
++    settle();
++    StatusUpdate plain = working(false);
++    plain.backgroundTasks = 1;
++    status.apply(plain);
++    status.apply(bookkeeping(0));
++    QCOMPARE(text(status), QStringLiteral("working"));
++    QVERIFY(!status.hasArmedExpiration());
++}
++
++void SessionStatusTest::testDeltaReachingZeroReleases()
++{
++    SessionStatus status(nullptr, delay);
++    StatusUpdate update = working(true);
++    update.backgroundTasks = 1;
++    status.apply(update);
++    endOperation(status);
++    settle();
++    QCOMPARE(text(status), QStringLiteral("working"));
++    status.apply(delta(-1));
++    QCOMPARE(text(status), QStringLiteral("idle"));
++}
++
++void SessionStatusTest::testBookkeepingDoesNotReleaseANewTurn()
++{
++    SessionStatus status(nullptr, delay);
++    status.apply(working(true));
++    endOperation(status);
++    settle();
++    QCOMPARE(text(status), QStringLiteral("idle"));
++    // A new turn armed before its operation starts must wait for its own end.
++    status.apply(working(true));
++    status.apply(bookkeeping(0));
++    QCOMPARE(text(status), QStringLiteral("working"));
++}
++
++void SessionStatusTest::testClearSupersedesAPendingExpiration()
++{
++    SessionStatus status(nullptr, delay);
++    StatusUpdate update = working(true);
++    update.backgroundTasks = 2;
++    update.turnOpen = true;
++    status.apply(update);
++    endOperation(status);
++    QVERIFY(status.clearStatus());
++    QVERIFY(!status.hasArmedExpiration());
++    settle();
++    QVERIFY(!status.statusText().has_value());
++    QCOMPARE(status.backgroundTasks(), 0);
++    QVERIFY(!status.turnOpen().has_value());
++    // Nothing left to clear.
++    QVERIFY(!status.clearStatus());
++}
++
++void SessionStatusTest::testProgramExitDropsEverything()
++{
++    SessionStatus status(nullptr, delay);
++    status.apply(working(true));
++    endOperation(status);
++    status.programDidExit();
++    QSignalSpy changed(&status, &SessionStatus::changed);
++    settle();
++    QVERIFY(!status.hasActiveStatus());
++    QVERIFY(!status.hasArmedExpiration());
++    // The stale timer brings nothing back.
++    QCOMPARE(changed.count(), 0);
++}
++
++void SessionStatusTest::testAfterExitAStopCannotEndAnUnseenOperation()
++{
++    SessionStatus status(nullptr, delay);
++    status.progressReported(indeterminate);
++    status.programDidExit();
++    status.apply(working(true));
++    status.progressReported(stopped);
++    settle();
++    QCOMPARE(text(status), QStringLiteral("working"));
++}
++
++void SessionStatusTest::testChangesCarryThePreviousText()
++{
++    SessionStatus status(nullptr, delay);
++    QSignalSpy changed(&status, &SessionStatus::changed);
++    status.apply(working(true));
++    endOperation(status);
++    settle();
++    QCOMPARE(changed.count(), 2);
++    QCOMPARE(changed.at(0).at(0).value<std::optional<QString>>(), std::nullopt);
++    QCOMPARE(changed.at(1).at(0).value<std::optional<QString>>(), QStringLiteral("working"));
++}
++
++void SessionStatusTest::testKeyPressTurnsDoneAndErrorIdle()
++{
++    for (const QString &finished : {QStringLiteral("done"), QStringLiteral("Error")}) {
++        SessionStatus status;
++        StatusUpdate update = withStatus(finished);
++        update.fields.detail = QStringLiteral("All tests pass");
++        status.apply(update);
++        status.userDidPressKey();
++        QCOMPARE(text(status), QStringLiteral("idle"));
++        QCOMPARE(status.detail(), QStringLiteral("All tests pass"));
++        QVERIFY(status.indicator().isValid());
++    }
++}
++
++void SessionStatusTest::testKeyPressLeavesOtherStatusesAlone()
++{
++    for (const QString &other : {QStringLiteral("working"), QStringLiteral("waiting"), QStringLiteral("idle"), QStringLiteral("Deploying")}) {
++        SessionStatus status;
++        status.apply(withStatus(other));
++        QSignalSpy changed(&status, &SessionStatus::changed);
++        status.userDidPressKey();
++        QCOMPARE(text(status), other);
++        QCOMPARE(changed.count(), 0);
++    }
++    // No status: a key press creates none.
++    SessionStatus empty;
++    empty.userDidPressKey();
++    QVERIFY(!empty.hasActiveStatus());
++}
++
++void SessionStatusTest::testTabStatusUpdateConverts()
++{
++    SessionStatus status(nullptr, delay);
++    status.apply(StatusUpdate::fromTabStatus(Konsole::TabStatusUpdate::fromOsc21337(u"status=Working;indicator=#ffa500;expires-on=progress-end")));
++    QCOMPARE(text(status), QStringLiteral("Working"));
++    QCOMPARE(status.indicator().name(), QStringLiteral("#ffa500"));
++    endOperation(status);
++    settle();
++    // No then- keys: the status is cleared.
++    QVERIFY(!status.hasActiveStatus());
++}
++
++QTEST_GUILESS_MAIN(SessionStatusTest)
++
++#include "SessionStatusTest.moc"
+diff --git a/src/plugins/ClaudeCode/claudecodedbus.cpp b/src/plugins/ClaudeCode/claudecodedbus.cpp
+index ba75cac..160860c 100644
+--- a/src/plugins/ClaudeCode/claudecodedbus.cpp
++++ b/src/plugins/ClaudeCode/claudecodedbus.cpp
+@@ -2,14 +2,17 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "claudecodedbus.h"
++#include "sessionstatus.h"
++#include "sessionstatusregistry.h"
+ 
+ #include "session/Session.h"
+-#include "session/SessionManager.h"
+ 
+ #include <QDBusConnection>
++#include <QJsonDocument>
+ 
+-ClaudeCodeDBus::ClaudeCodeDBus(QObject *parent)
++ClaudeCodeDBus::ClaudeCodeDBus(SessionStatusRegistry *registry, QObject *parent)
+     : QObject(parent)
++    , _registry(registry)
+ {
+ }
+ 
+@@ -26,11 +29,52 @@ QString ClaudeCodeDBus::ping() const
+ QStringList ClaudeCodeDBus::sessions() const
+ {
+     QStringList paths;
+-    const auto sessions = Konsole::SessionManager::instance()->sessions();
++    const auto sessions = _registry->sessions();
+     for (const Konsole::Session *session : sessions) {
+         paths.append(QStringLiteral("/Sessions/%1").arg(session->sessionId()));
+     }
++    paths.sort();
+     return paths;
+ }
+ 
++QString ClaudeCodeDBus::setStatus(const QString &session, const QVariantMap &arguments)
++{
++    SessionStatus *status = statusOrError(session);
++    if (status == nullptr) {
++        return {};
++    }
++    QString error;
++    const auto update = StatusUpdate::fromArguments(arguments, &error);
++    if (!update.has_value()) {
++        sendErrorReply(QStringLiteral("org.kde.konsole.ClaudeCode.InvalidArgument"), error);
++        return {};
++    }
++    status->apply(*update);
++    return QString::fromUtf8(QJsonDocument(status->toJson()).toJson(QJsonDocument::Compact));
++}
++
++QString ClaudeCodeDBus::getStatus(const QString &session)
++{
++    SessionStatus *status = statusOrError(session);
++    if (status == nullptr) {
++        return {};
++    }
++    return QString::fromUtf8(QJsonDocument(status->toJson()).toJson(QJsonDocument::Compact));
++}
++
++qlonglong ClaudeCodeDBus::getBackgroundTaskCount(const QString &session)
++{
++    SessionStatus *status = statusOrError(session);
++    return status != nullptr ? status->backgroundTasks() : 0;
++}
++
++SessionStatus *ClaudeCodeDBus::statusOrError(const QString &session)
++{
++    SessionStatus *status = _registry->status(_registry->session(session));
++    if (status == nullptr) {
++        sendErrorReply(QStringLiteral("org.kde.konsole.ClaudeCode.NoSuchSession"), QStringLiteral("No such session: %1").arg(session));
++    }
++    return status;
++}
++
+ #include "moc_claudecodedbus.cpp"
+diff --git a/src/plugins/ClaudeCode/claudecodedbus.h b/src/plugins/ClaudeCode/claudecodedbus.h
+index 9242204..a3fd321 100644
+--- a/src/plugins/ClaudeCode/claudecodedbus.h
++++ b/src/plugins/ClaudeCode/claudecodedbus.h
+@@ -4,21 +4,30 @@
+ #ifndef CLAUDECODEDBUS_H
+ #define CLAUDECODEDBUS_H
+ 
++#include <QDBusContext>
+ #include <QObject>
+ #include <QStringList>
++#include <QVariantMap>
++
++class SessionStatus;
++class SessionStatusRegistry;
+ 
+ /**
+- * The plugin's D-Bus object, at /ClaudeCode on Konsole's own service.
+- * Hooks running in a Konsole session reach it through
+- * $KONSOLE_DBUS_SERVICE.
++ * The plugin's D-Bus object, at /ClaudeCode on Konsole's own service,
++ * interface org.kde.konsole.ClaudeCode. The it2 command that cc-status runs
++ * reaches it through the service and session named in $TERM_SESSION_ID.
++ *
++ * Sessions are named by their D-Bus path (/Sessions/3) or number (3).
++ * Errors: org.kde.konsole.ClaudeCode.NoSuchSession and
++ * org.kde.konsole.ClaudeCode.InvalidArgument.
+  */
+-class ClaudeCodeDBus : public QObject
++class ClaudeCodeDBus : public QObject, protected QDBusContext
+ {
+     Q_OBJECT
+     Q_CLASSINFO("D-Bus Interface", "org.kde.konsole.ClaudeCode")
+ 
+ public:
+-    explicit ClaudeCodeDBus(QObject *parent);
++    ClaudeCodeDBus(SessionStatusRegistry *registry, QObject *parent);
+ 
+     /** Registers the object on the session bus. Returns whether it succeeded. */
+     bool registerObject();
+@@ -29,6 +38,25 @@ public Q_SLOTS:
+ 
+     /** Returns the D-Bus paths of the sessions the plugin sees, such as /Sessions/1. */
+     QStringList sessions() const;
++
++    /**
++     * Applies a status update, with the arguments iTerm2's set_session_status
++     * takes (see StatusUpdate::fromArguments), and returns the status as it
++     * then stands, as JSON. An update whose preconditions fail is dropped and
++     * the status it was dropped against comes back.
++     */
++    QString setStatus(const QString &session, const QVariantMap &arguments);
++
++    /** Returns the session's status as JSON (see SessionStatus::toJson). */
++    QString getStatus(const QString &session);
++
++    /** Returns the background-task count cc-status last parked for the session. */
++    qlonglong getBackgroundTaskCount(const QString &session);
++
++private:
++    SessionStatus *statusOrError(const QString &session);
++
++    SessionStatusRegistry *_registry;
+ };
+ 
+ #endif // CLAUDECODEDBUS_H
+diff --git a/src/plugins/ClaudeCode/claudecodeplugin.cpp b/src/plugins/ClaudeCode/claudecodeplugin.cpp
+index 3014355..0ed8550 100644
+--- a/src/plugins/ClaudeCode/claudecodeplugin.cpp
++++ b/src/plugins/ClaudeCode/claudecodeplugin.cpp
+@@ -5,8 +5,12 @@
+ #include "claudecodedbus.h"
+ #include "claudesessionswidget.h"
+ #include "konsoledebug.h"
++#include "sessionstatus.h"
++#include "sessionstatusregistry.h"
+ 
+ #include "MainWindow.h"
++#include "session/SessionController.h"
++#include "terminalDisplay/TerminalDisplay.h"
+ 
+ #include <KActionCollection>
+ #include <KLocalizedString>
+@@ -16,6 +20,7 @@
+ K_PLUGIN_CLASS_WITH_JSON(ClaudeCodePlugin, "konsole_claudecode.json")
+ 
+ struct ClaudeCodePlugin::Private {
++    SessionStatusRegistry *registry = nullptr;
+     QMap<Konsole::MainWindow *, QDockWidget *> dockForWindow;
+ };
+ 
+@@ -25,7 +30,8 @@ ClaudeCodePlugin::ClaudeCodePlugin(QObject *object, const QVariantList &args)
+ {
+     setName(QStringLiteral("ClaudeCode"));
+ 
+-    auto *dbus = new ClaudeCodeDBus(this);
++    priv->registry = new SessionStatusRegistry(this);
++    auto *dbus = new ClaudeCodeDBus(priv->registry, this);
+     if (!dbus->registerObject()) {
+         qCWarning(KonsoleDebug) << "Claude Code plugin could not register /ClaudeCode on D-Bus";
+     }
+@@ -51,8 +57,17 @@ void ClaudeCodePlugin::createWidgetsForMainWindow(Konsole::MainWindow *mainWindo
+ 
+ void ClaudeCodePlugin::activeViewChanged(Konsole::SessionController *controller, Konsole::MainWindow *mainWindow)
+ {
+-    Q_UNUSED(controller)
+     Q_UNUSED(mainWindow)
++    if (controller == nullptr || controller->view() == nullptr) {
++        return;
++    }
++    // A key press in a session showing a finished or failed turn means the
++    // user has seen it. Only the active view takes keys, so connecting here
++    // covers every view that ever does.
++    SessionStatus *status = priv->registry->status(controller->session());
++    if (status != nullptr) {
++        connect(controller->view(), &Konsole::TerminalDisplay::keyPressedSignal, status, &SessionStatus::userDidPressKey, Qt::UniqueConnection);
++    }
+ }
+ 
+ QList<QAction *> ClaudeCodePlugin::menuBarActions(Konsole::MainWindow *mainWindow) const
+diff --git a/src/plugins/ClaudeCode/hook/claude-code-hook b/src/plugins/ClaudeCode/hook/claude-code-hook
+new file mode 100755
+index 0000000..ddd3a01
+--- /dev/null
++++ b/src/plugins/ClaudeCode/hook/claude-code-hook
+@@ -0,0 +1,25 @@
++#!/bin/sh
++# SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++# SPDX-License-Identifier: GPL-2.0-or-later
++#
++# Claude Code hook for Konsole's Claude Code plugin. Point every hook event
++# that iTerm2's integration uses at this script.
++#
++# It runs iTerm2's cc-status, which turns each hook event into an
++# `it2 set-status` call, with the it2 next to it, which forwards the call to
++# the plugin over D-Bus.
++
++# Outside Konsole there is nothing to report to. Drain the payload so Claude
++# Code never writes into a closed pipe.
++if [ -z "$KONSOLE_DBUS_SERVICE" ] || [ -z "$KONSOLE_DBUS_SESSION" ]; then
++    cat >/dev/null
++    exit 0
++fi
++
++# cc-status names the session by $TERM_SESSION_ID (whatever follows the first
++# colon) and only runs it2 once $IT2_SOCK says there is something to reach.
++TERM_SESSION_ID="konsole:${KONSOLE_DBUS_SERVICE}${KONSOLE_DBUS_SESSION}"
++IT2_SOCK=konsole
++export TERM_SESSION_ID IT2_SOCK
++
++exec "$(dirname "$(readlink -f "$0")")/cc-status" "$@"
+diff --git a/src/plugins/ClaudeCode/it2/CMakeLists.txt b/src/plugins/ClaudeCode/it2/CMakeLists.txt
+new file mode 100644
+index 0000000..bf8d88d
+--- /dev/null
++++ b/src/plugins/ClaudeCode/it2/CMakeLists.txt
+@@ -0,0 +1,14 @@
++# A stand-in for iTerm2's it2 command, covering what cc-status runs. It is
++# named it2 because cc-status looks for it2 next to its own executable.
++add_executable(claudecode-it2 it2.cpp)
++set_target_properties(claudecode-it2 PROPERTIES
++    OUTPUT_NAME it2
++    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/claudecode
++)
++target_link_libraries(claudecode-it2 Qt::Core Qt::DBus)
++install(TARGETS claudecode-it2 DESTINATION ${KDE_INSTALL_LIBEXECDIR}/konsole-claudecode)
++
++# The hook Claude Code runs, installed beside it2 and cc-status. cc-status is
++# built separately, with Swift, from iTerm2's source.
++configure_file(${CMAKE_CURRENT_SOURCE_DIR}/../hook/claude-code-hook ${CMAKE_BINARY_DIR}/bin/claudecode/claude-code-hook COPYONLY)
++install(PROGRAMS ${CMAKE_CURRENT_SOURCE_DIR}/../hook/claude-code-hook DESTINATION ${KDE_INSTALL_LIBEXECDIR}/konsole-claudecode)
+diff --git a/src/plugins/ClaudeCode/it2/it2.cpp b/src/plugins/ClaudeCode/it2/it2.cpp
+new file mode 100644
+index 0000000..154d4a0
+--- /dev/null
++++ b/src/plugins/ClaudeCode/it2/it2.cpp
+@@ -0,0 +1,255 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// A stand-in for iTerm2's it2 command, covering the calls cc-status makes:
++//
++//   it2 set-status --session=<id> [--quiet-if-unresolved] [--json] [--status=...] ...
++//   it2 session get-status --session=<id> [--quiet-if-unresolved]
++//   it2 session get-background-tasks --session=<id> [--quiet-if-unresolved]
++//
++// Each becomes a call to the Claude Code plugin's D-Bus object in Konsole.
++// The session id is what cc-status takes from $TERM_SESSION_ID, which the
++// Konsole hook wrapper sets to "konsole:<D-Bus service><session path>", for
++// example "konsole:org.kde.konsole-1234/Sessions/3".
++//
++// Options take "--name=value" or "--name value". An empty value always comes
++// as two arguments. Exit status: 0 on success, 1 when the call failed, 2 for
++// a usage error.
++
++#include <QCoreApplication>
++#include <QDBusConnection>
++#include <QDBusMessage>
++#include <QDBusVariant>
++#include <QStringList>
++#include <QTextStream>
++#include <QVariantMap>
++
++#include <cstdio>
++
++namespace
++{
++enum class Kind {
++    Text,
++    Integer,
++    Boolean,
++};
++
++// The set-status options and how each is sent to the plugin. The D-Bus
++// argument names are iTerm2's set_session_status ones.
++struct StatusOption {
++    const char *name;
++    const char *argument;
++    Kind kind;
++};
++
++const StatusOption statusOptions[] = {
++    {"status", "status", Kind::Text},
++    {"dot-color", "dot_color", Kind::Text},
++    {"text-color", "text_color", Kind::Text},
++    {"detail", "detail", Kind::Text},
++    {"background-tasks", "background_tasks", Kind::Integer},
++    {"background-tasks-delta", "background_tasks_delta", Kind::Integer},
++    {"turn-open", "turn_open", Kind::Boolean},
++    {"if-turn-open", "if_turn_open", Kind::Boolean},
++    {"if-background-tasks", "if_background_tasks", Kind::Integer},
++    {"expires-on", "expires_on", Kind::Text},
++    {"then-status", "then_status", Kind::Text},
++    {"then-dot-color", "then_dot_color", Kind::Text},
++    {"then-text-color", "then_text_color", Kind::Text},
++    {"then-detail", "then_detail", Kind::Text},
++};
++
++const QStringList addressOptions = {QStringLiteral("session"), QStringLiteral("tmux"), QStringLiteral("tmux-pane")};
++const QStringList flagOptions = {QStringLiteral("json"), QStringLiteral("quiet-if-unresolved")};
++
++struct Invocation {
++    QString command;
++    QHash<QString, QString> options;
++    QSet<QString> flags;
++};
++
++QTextStream &err()
++{
++    static QTextStream stream(stderr);
++    return stream;
++}
++
++QTextStream &out()
++{
++    static QTextStream stream(stdout);
++    return stream;
++}
++
++bool isValueOption(const QString &name)
++{
++    if (addressOptions.contains(name)) {
++        return true;
++    }
++    for (const auto &option : statusOptions) {
++        if (name == QLatin1String(option.name)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++// Parses the command line, or returns false after printing a usage error.
++bool parse(const QStringList &arguments, Invocation *invocation)
++{
++    int i = 0;
++    if (arguments.value(0) == QLatin1String("set-status")) {
++        invocation->command = QStringLiteral("set-status");
++        i = 1;
++    } else if (arguments.value(0) == QLatin1String("session")
++               && (arguments.value(1) == QLatin1String("get-status") || arguments.value(1) == QLatin1String("get-background-tasks"))) {
++        invocation->command = arguments.value(1);
++        i = 2;
++    } else {
++        err() << "it2: unsupported command: " << arguments.join(QLatin1Char(' ')) << Qt::endl;
++        return false;
++    }
++
++    for (; i < arguments.size(); i++) {
++        const QString &argument = arguments.at(i);
++        if (!argument.startsWith(QLatin1String("--"))) {
++            err() << "it2: unexpected argument: " << argument << Qt::endl;
++            return false;
++        }
++        const qsizetype separator = argument.indexOf(QLatin1Char('='));
++        const QString name = argument.mid(2, separator < 0 ? -1 : separator - 2);
++        if (flagOptions.contains(name) && separator < 0) {
++            invocation->flags.insert(name);
++        } else if (!isValueOption(name)) {
++            err() << "it2: unknown option: --" << name << Qt::endl;
++            return false;
++        } else if (separator >= 0) {
++            invocation->options.insert(name, argument.mid(separator + 1));
++        } else if (i + 1 < arguments.size()) {
++            invocation->options.insert(name, arguments.at(++i));
++        } else {
++            err() << "it2: missing value for --" << name << Qt::endl;
++            return false;
++        }
++    }
++    return true;
++}
++
++// Splits a session id into the Konsole D-Bus service and session path.
++bool resolve(const Invocation &invocation, QString *service, QString *session)
++{
++    // A tmux pane is not something Konsole can map to a session yet.
++    if (invocation.options.contains(QStringLiteral("tmux"))) {
++        return false;
++    }
++    const QString id = invocation.options.value(QStringLiteral("session"));
++    const qsizetype path = id.indexOf(QLatin1String("/Sessions/"));
++    if (path <= 0) {
++        return false;
++    }
++    *service = id.left(path);
++    *session = id.mid(path);
++    return true;
++}
++
++// Builds the set-status arguments for the plugin, or returns false after
++// printing what is wrong.
++bool statusArguments(const Invocation &invocation, QVariantMap *arguments)
++{
++    for (const auto &option : statusOptions) {
++        const auto it = invocation.options.constFind(QLatin1String(option.name));
++        if (it == invocation.options.cend()) {
++            continue;
++        }
++        bool ok = true;
++        QVariant value;
++        switch (option.kind) {
++        case Kind::Text:
++            value = *it;
++            break;
++        case Kind::Integer:
++            value = it->toLongLong(&ok);
++            break;
++        case Kind::Boolean:
++            ok = *it == QLatin1String("true") || *it == QLatin1String("false");
++            value = *it == QLatin1String("true");
++            break;
++        }
++        if (!ok) {
++            err() << "it2: invalid value for --" << option.name << ": " << *it << Qt::endl;
++            return false;
++        }
++        arguments->insert(QLatin1String(option.argument), value);
++    }
++    return true;
++}
++
++// Whether a failed call means the session could not be found, as opposed to
++// the call itself being wrong. Konsole not running, the plugin not loaded and
++// an unknown session all count.
++bool isUnresolved(const QDBusMessage &reply)
++{
++    const QString name = reply.errorName();
++    return name == QLatin1String("org.freedesktop.DBus.Error.ServiceUnknown") || name == QLatin1String("org.freedesktop.DBus.Error.NameHasNoOwner")
++        || name == QLatin1String("org.freedesktop.DBus.Error.UnknownObject") || name == QLatin1String("org.freedesktop.DBus.Error.UnknownMethod")
++        || name == QLatin1String("org.freedesktop.DBus.Error.UnknownInterface") || name == QLatin1String("org.kde.konsole.ClaudeCode.NoSuchSession");
++}
++}
++
++int main(int argc, char *argv[])
++{
++    QCoreApplication app(argc, argv);
++    QStringList arguments = app.arguments();
++    arguments.removeFirst();
++
++    Invocation invocation;
++    if (!parse(arguments, &invocation)) {
++        return 2;
++    }
++    const bool quiet = invocation.flags.contains(QStringLiteral("quiet-if-unresolved"));
++
++    QString service;
++    QString session;
++    if (!resolve(invocation, &service, &session)) {
++        if (quiet) {
++            return 0;
++        }
++        err() << "it2: cannot find a Konsole session for this pane" << Qt::endl;
++        return 1;
++    }
++
++    QDBusMessage call;
++    const QString path = QStringLiteral("/ClaudeCode");
++    const QString interface = QStringLiteral("org.kde.konsole.ClaudeCode");
++    if (invocation.command == QLatin1String("set-status")) {
++        QVariantMap statusArgs;
++        if (!statusArguments(invocation, &statusArgs)) {
++            return 2;
++        }
++        call = QDBusMessage::createMethodCall(service, path, interface, QStringLiteral("setStatus"));
++        call << session << statusArgs;
++    } else if (invocation.command == QLatin1String("get-status")) {
++        call = QDBusMessage::createMethodCall(service, path, interface, QStringLiteral("getStatus"));
++        call << session;
++    } else {
++        call = QDBusMessage::createMethodCall(service, path, interface, QStringLiteral("getBackgroundTaskCount"));
++        call << session;
++    }
++
++    // A status update is cosmetic: never hold up the hook for long.
++    const QDBusMessage reply = QDBusConnection::sessionBus().call(call, QDBus::Block, 5000);
++    if (reply.type() == QDBusMessage::ErrorMessage) {
++        if (quiet && isUnresolved(reply)) {
++            return 0;
++        }
++        err() << "it2: " << reply.errorMessage() << Qt::endl;
++        return 1;
++    }
++
++    const QVariant result = reply.arguments().value(0);
++    if (invocation.command == QLatin1String("set-status") && !invocation.flags.contains(QStringLiteral("json"))) {
++        out() << "Session status updated." << Qt::endl;
++    } else {
++        out() << result.toString() << Qt::endl;
++    }
++    return 0;
++}
+diff --git a/src/plugins/ClaudeCode/sessionstatus.cpp b/src/plugins/ClaudeCode/sessionstatus.cpp
+new file mode 100644
+index 0000000..b534c6d
+--- /dev/null
++++ b/src/plugins/ClaudeCode/sessionstatus.cpp
+@@ -0,0 +1,432 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "sessionstatus.h"
++
++#include <QTimer>
++
++#include <algorithm>
++#include <limits>
++
++using Konsole::TabStatusFields;
++using Konsole::TerminalProgress;
++
++namespace
++{
++// cc-status's idle colors, used when a key press turns a finished turn idle.
++const QColor idleIndicator(0x00, 0xd7, 0x5f);
++const QColor idleStatusColor(0x88, 0x88, 0x88);
++
++std::optional<QString> stringArgument(const QVariantMap &arguments, const char *key)
++{
++    const auto it = arguments.constFind(QLatin1String(key));
++    if (it == arguments.cend()) {
++        return std::nullopt;
++    }
++    return it->toString();
++}
++
++std::optional<qint64> integerArgument(const QVariantMap &arguments, const char *key, bool *valid)
++{
++    const auto it = arguments.constFind(QLatin1String(key));
++    if (it == arguments.cend()) {
++        return std::nullopt;
++    }
++    bool ok = false;
++    const qint64 value = it->toLongLong(&ok);
++    if (!ok) {
++        *valid = false;
++    }
++    return value;
++}
++
++std::optional<bool> boolArgument(const QVariantMap &arguments, const char *key, bool *valid)
++{
++    const auto it = arguments.constFind(QLatin1String(key));
++    if (it == arguments.cend()) {
++        return std::nullopt;
++    }
++    if (it->typeId() == QMetaType::Bool) {
++        return it->toBool();
++    }
++    const QString text = it->toString();
++    if (text == QLatin1String("true") || text == QLatin1String("1")) {
++        return true;
++    }
++    if (text == QLatin1String("false") || text == QLatin1String("0")) {
++        return false;
++    }
++    *valid = false;
++    return std::nullopt;
++}
++
++// A color argument: #rrggbb or #rgb. An empty one clears the field, which an
++// invalid QColor stands for.
++std::optional<QColor> parseColor(const QString &text)
++{
++    if (text.isEmpty()) {
++        return QColor();
++    }
++    if (!text.startsWith(QLatin1Char('#')) || (text.size() != 4 && text.size() != 7)) {
++        return std::nullopt;
++    }
++    const QColor color = QColor::fromString(text);
++    return color.isValid() ? std::optional<QColor>(color) : std::nullopt;
++}
++
++// Fills one set of visible fields. The status and the fallback it expires to
++// take the same fields, parsed the same way. Returns false and sets the error
++// when a color does not parse.
++bool populate(TabStatusFields &fields, const QVariantMap &arguments, const QString &prefix, QString *error)
++{
++    const auto key = [&prefix](const char *name) {
++        return (prefix + QLatin1String(name)).toLatin1();
++    };
++    fields.status = stringArgument(arguments, key("status").constData());
++    fields.detail = stringArgument(arguments, key("detail").constData());
++
++    for (const char *name : {"text_color", "dot_color"}) {
++        const auto text = stringArgument(arguments, key(name).constData());
++        if (!text.has_value()) {
++            continue;
++        }
++        const auto color = parseColor(*text);
++        if (!color.has_value()) {
++            *error = QStringLiteral("Invalid %1%2 (expected #rrggbb)").arg(prefix, QLatin1String(name));
++            return false;
++        }
++        (qstrcmp(name, "text_color") == 0 ? fields.statusColor : fields.indicator) = color;
++    }
++    return true;
++}
++}
++
++bool StatusUpdate::assertsStatus() const
++{
++    return fields != TabStatusFields() || expiresOnProgressEnd;
++}
++
++StatusUpdate StatusUpdate::fromTabStatus(const Konsole::TabStatusUpdate &update)
++{
++    StatusUpdate result;
++    result.fields = update.fields;
++    result.expiresOnProgressEnd = update.expiresOnProgressEnd;
++    result.fallback = update.fallback;
++    return result;
++}
++
++std::optional<StatusUpdate> StatusUpdate::fromArguments(const QVariantMap &arguments, QString *error)
++{
++    StatusUpdate update;
++    if (!populate(update.fields, arguments, QString(), error)) {
++        return std::nullopt;
++    }
++
++    bool valid = true;
++    const auto backgroundTasks = integerArgument(arguments, "background_tasks", &valid);
++    const auto delta = integerArgument(arguments, "background_tasks_delta", &valid);
++    update.turnOpen = boolArgument(arguments, "turn_open", &valid);
++    update.requiredTurnOpen = boolArgument(arguments, "if_turn_open", &valid);
++    update.requiredBackgroundTasks = integerArgument(arguments, "if_background_tasks", &valid);
++    if (!valid) {
++        *error = QStringLiteral("Invalid number or boolean argument");
++        return std::nullopt;
++    }
++    if (backgroundTasks.has_value() && delta.has_value()) {
++        *error = QStringLiteral("Pass background_tasks or background_tasks_delta, not both.");
++        return std::nullopt;
++    }
++    if (backgroundTasks.has_value()) {
++        update.backgroundTasks = std::max<qint64>(0, *backgroundTasks);
++    }
++    update.backgroundTasksDelta = delta;
++
++    const QString then = QStringLiteral("then_");
++    const bool hasFallbackArguments = std::any_of(arguments.keyBegin(), arguments.keyEnd(), [&then](const QString &key) {
++        return key.startsWith(then);
++    });
++    const QString expiresOn = stringArgument(arguments, "expires_on").value_or(QString());
++    if (!expiresOn.isEmpty()) {
++        if (expiresOn != QLatin1String("progress-end")) {
++            *error = QStringLiteral("Unknown expires_on \"%1\". The only supported value is progress-end.").arg(expiresOn);
++            return std::nullopt;
++        }
++        // With no then_ arguments the status simply goes away when it expires.
++        if (hasFallbackArguments) {
++            if (!populate(update.fallback, arguments, then, error)) {
++                return std::nullopt;
++            }
++        } else {
++            update.fallback = TabStatusFields::cleared();
++        }
++        update.expiresOnProgressEnd = true;
++    } else if (hasFallbackArguments) {
++        *error = QStringLiteral("The then_ arguments only mean something with expires_on, which was not given.");
++        return std::nullopt;
++    }
++    return update;
++}
++
++SessionStatus::SessionStatus(QObject *parent, int progressEndDelayMs)
++    : QObject(parent)
++    , _progressEndDelayMs(progressEndDelayMs)
++{
++}
++
++std::optional<QString> SessionStatus::statusText() const
++{
++    return _display.statusText;
++}
++
++QColor SessionStatus::indicator() const
++{
++    return _display.indicator;
++}
++
++QColor SessionStatus::statusColor() const
++{
++    return _display.statusColor;
++}
++
++std::optional<QString> SessionStatus::detail() const
++{
++    return _display.detail;
++}
++
++qint64 SessionStatus::backgroundTasks() const
++{
++    return _backgroundTasks;
++}
++
++std::optional<bool> SessionStatus::turnOpen() const
++{
++    return _turnOpen;
++}
++
++bool SessionStatus::hasActiveStatus() const
++{
++    return _display.indicator.isValid() || _display.statusText.has_value();
++}
++
++bool SessionStatus::hasArmedExpiration() const
++{
++    return _armedFallback.has_value();
++}
++
++bool SessionStatus::preconditionsHold(const StatusUpdate &update) const
++{
++    // An unknown turn flag satisfies neither value.
++    if (update.requiredTurnOpen.has_value() && _turnOpen != update.requiredTurnOpen) {
++        return false;
++    }
++    if (update.requiredBackgroundTasks.has_value() && _backgroundTasks != *update.requiredBackgroundTasks) {
++        return false;
++    }
++    return true;
++}
++
++bool SessionStatus::apply(const StatusUpdate &update)
++{
++    // A dropped update must not supersede an armed expiration either: the
++    // status it would have replaced is still the one last asserted.
++    if (!preconditionsHold(update)) {
++        return false;
++    }
++
++    const bool asserts = update.assertsStatus();
++    if (asserts) {
++        // Whether the expiration being replaced was already released by the
++        // timer and only held back by background work. Read before the update
++        // lands, since it may carry a new count.
++        const bool previousWasHeld = _armedFallback.has_value() && _headStartElapsed && _generation == _operationEndGeneration && _backgroundTasks > 0;
++
++        // A new assertion supersedes whatever the last one asked to happen
++        // when it went stale; bumping the generation drops its timer.
++        _armedFallback = update.expiresOnProgressEnd ? std::optional<TabStatusFields>(update.fallback) : std::nullopt;
++        ++_generation;
++
++        // Re-armed while the last expiration was held: no operation has
++        // started since the one that ended, so this expiration belongs to it,
++        // and the count must stay able to release it.
++        if (previousWasHeld && _armedFallback.has_value()) {
++            _operationEndGeneration = _generation;
++        }
++    }
++
++    const auto previousText = _display.statusText;
++    if (applyToState(update)) {
++        Q_EMIT changed(previousText);
++    }
++
++    // A count arriving after the head start may report that the last of the
++    // background work holding an expiration has finished. Only a count can
++    // change that answer, and an assertion since the operation ended belongs
++    // to an operation that has not ended yet.
++    const bool changesCount = update.backgroundTasks.has_value() || update.backgroundTasksDelta.has_value();
++    if (!asserts && changesCount && _headStartElapsed && _generation == _operationEndGeneration) {
++        expireNow();
++    }
++    return true;
++}
++
++bool SessionStatus::applyToState(const StatusUpdate &update)
++{
++    const bool changed = applyFields(update.fields);
++
++    if (update.backgroundTasks.has_value()) {
++        _backgroundTasks = *update.backgroundTasks;
++    } else if (update.backgroundTasksDelta.has_value()) {
++        // The delta comes from a command line, so saturate instead of overflowing.
++        const qint64 delta = *update.backgroundTasksDelta;
++        qint64 sum = 0;
++        if (__builtin_add_overflow(_backgroundTasks, delta, &sum)) {
++            _backgroundTasks = delta > 0 ? std::numeric_limits<qint64>::max() : 0;
++        } else {
++            _backgroundTasks = std::max<qint64>(0, sum);
++        }
++    }
++    if (update.turnOpen.has_value()) {
++        _turnOpen = update.turnOpen;
++    }
++    // The count and the turn flag never count as a visible change.
++    return changed;
++}
++
++bool SessionStatus::applyFields(const TabStatusFields &fields)
++{
++    const Display before = _display;
++    if (fields.indicator.has_value()) {
++        _display.indicator = *fields.indicator;
++    }
++    if (fields.status.has_value()) {
++        _display.statusText = fields.status->isEmpty() ? std::nullopt : fields.status;
++    }
++    if (fields.statusColor.has_value()) {
++        _display.statusColor = *fields.statusColor;
++    }
++    if (fields.detail.has_value()) {
++        _display.detail = fields.detail->isEmpty() ? std::nullopt : fields.detail;
++    }
++    return !(_display == before);
++}
++
++void SessionStatus::progressReported(const std::optional<TerminalProgress> &progress)
++{
++    // A stop ends the operation, and so does an error: a program that reports
++    // a failure may exit without ever reporting a stop. Paused and percentages
++    // mean it is still running.
++    const bool endsOperation = !progress.has_value() || progress->state == TerminalProgress::Error;
++    if (!endsOperation) {
++        _progressWasRunning = true;
++        _headStartElapsed = false;
++        // Whatever ended a moment ago evidently did not stay ended.
++        ++_generation;
++        return;
++    }
++    if (!_progressWasRunning) {
++        return;
++    }
++    _progressWasRunning = false;
++    ++_generation;
++    _operationEndGeneration = _generation;
++    if (!_armedFallback.has_value()) {
++        return;
++    }
++    const int scheduled = _generation;
++    QTimer::singleShot(_progressEndDelayMs, this, [this, scheduled] {
++        expire(scheduled);
++    });
++}
++
++void SessionStatus::expire(int scheduledGeneration)
++{
++    if (scheduledGeneration != _generation) {
++        return;
++    }
++    // From here a held expiration is released the moment its count changes.
++    _headStartElapsed = true;
++    expireNow();
++}
++
++void SessionStatus::expireNow()
++{
++    // Stays armed while background work is counted: the program has not
++    // finished, and the status it last asserted is still the true one.
++    if (!_armedFallback.has_value() || _backgroundTasks != 0) {
++        return;
++    }
++    const TabStatusFields fallback = *_armedFallback;
++    _armedFallback.reset();
++    const auto previousText = _display.statusText;
++    if (applyFields(fallback)) {
++        Q_EMIT changed(previousText);
++    }
++}
++
++void SessionStatus::userDidPressKey()
++{
++    const QString text = _display.statusText.value_or(QString()).toLower();
++    if (text != QLatin1String("done") && text != QLatin1String("error")) {
++        return;
++    }
++    StatusUpdate idle;
++    idle.fields.status = QStringLiteral("idle");
++    idle.fields.indicator = idleIndicator;
++    idle.fields.statusColor = idleStatusColor;
++    apply(idle);
++}
++
++bool SessionStatus::clearStatus()
++{
++    // An expiration can be armed without a visible field, and must not
++    // outlive the clear.
++    if (!hasActiveStatus() && !_armedFallback.has_value()) {
++        return false;
++    }
++    _armedFallback.reset();
++    ++_generation;
++    const auto previousText = _display.statusText;
++    _display = Display();
++    _backgroundTasks = 0;
++    _turnOpen.reset();
++    Q_EMIT changed(previousText);
++    return true;
++}
++
++void SessionStatus::programDidExit()
++{
++    const bool wasActive = hasActiveStatus();
++    const auto previousText = _display.statusText;
++    _display = Display();
++    _backgroundTasks = 0;
++    _turnOpen.reset();
++    _armedFallback.reset();
++    ++_generation;
++    // A restarted program starts from having reported nothing.
++    _progressWasRunning = false;
++    _headStartElapsed = false;
++    _operationEndGeneration = 0;
++    if (wasActive) {
++        Q_EMIT changed(previousText);
++    }
++}
++
++QJsonObject SessionStatus::toJson() const
++{
++    const auto text = [](const std::optional<QString> &value) {
++        return value.has_value() ? QJsonValue(*value) : QJsonValue(QJsonValue::Null);
++    };
++    const auto color = [](const QColor &value) {
++        return value.isValid() ? QJsonValue(value.name()) : QJsonValue(QJsonValue::Null);
++    };
++    return {
++        {QStringLiteral("status"), text(_display.statusText)},
++        {QStringLiteral("text_color"), color(_display.statusColor)},
++        {QStringLiteral("dot_color"), color(_display.indicator)},
++        {QStringLiteral("detail"), text(_display.detail)},
++        {QStringLiteral("background_tasks"), _backgroundTasks},
++        {QStringLiteral("turn_open"), _turnOpen.has_value() ? QJsonValue(*_turnOpen) : QJsonValue(QJsonValue::Null)},
++    };
++}
++
++#include "moc_sessionstatus.cpp"
+diff --git a/src/plugins/ClaudeCode/sessionstatus.h b/src/plugins/ClaudeCode/sessionstatus.h
+new file mode 100644
+index 0000000..619aed8
+--- /dev/null
++++ b/src/plugins/ClaudeCode/sessionstatus.h
+@@ -0,0 +1,163 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#ifndef SESSIONSTATUS_H
++#define SESSIONSTATUS_H
++
++#include "TabStatus.h"
++#include "TerminalProgress.h"
++
++#include <QColor>
++#include <QJsonObject>
++#include <QObject>
++#include <QString>
++#include <QVariantMap>
++
++#include <optional>
++
++/**
++ * One change to a session's status, from `it2 set-status` (through D-Bus)
++ * or from OSC 21337.
++ *
++ * The visible fields follow TabStatusFields: std::nullopt leaves a field
++ * alone, an empty value clears it. The rest is bookkeeping that cc-status
++ * parks here between hook events, preconditions that drop the whole update
++ * when they do not hold, and what to show when the operation the status
++ * belongs to ends.
++ */
++struct StatusUpdate {
++    Konsole::TabStatusFields fields;
++
++    std::optional<qint64> backgroundTasks;
++    std::optional<qint64> backgroundTasksDelta;
++    std::optional<bool> turnOpen;
++
++    std::optional<bool> requiredTurnOpen;
++    std::optional<qint64> requiredBackgroundTasks;
++
++    bool expiresOnProgressEnd = false;
++    Konsole::TabStatusFields fallback;
++
++    /**
++     * Whether the update says anything about what the session is doing, as
++     * opposed to only parking bookkeeping such as the task count. Only such
++     * an assertion replaces an armed expiration.
++     */
++    bool assertsStatus() const;
++
++    static StatusUpdate fromTabStatus(const Konsole::TabStatusUpdate &update);
++
++    /**
++     * Builds an update from `it2 set-status` arguments, keyed as iTerm2's
++     * set_session_status takes them: status, text_color, dot_color, detail,
++     * background_tasks, background_tasks_delta, turn_open, if_turn_open,
++     * if_background_tasks, expires_on and then_status, then_text_color,
++     * then_dot_color, then_detail. Returns std::nullopt and sets @p error for
++     * arguments that make no sense.
++     */
++    static std::optional<StatusUpdate> fromArguments(const QVariantMap &arguments, QString *error);
++};
++
++/**
++ * A session's status as cc-status reports it, and when a status scoped to an
++ * operation stops being true. A port of iTerm2's iTermSessionTabStatus and
++ * TabStatusController.
++ *
++ * A status can say it holds only until the program's current operation
++ * (announced with OSC 9;4 progress) ends, because an interrupt may run no hook
++ * that could report the change. When the operation ends the status gives way
++ * to its fallback, after a head start that lets the program's own, slower
++ * report win, and never while the program still counts background work.
++ */
++class SessionStatus : public QObject
++{
++    Q_OBJECT
++
++public:
++    /** How long an ended operation's status waits before expiring. */
++    static constexpr int defaultProgressEndDelayMs = 3000;
++
++    explicit SessionStatus(QObject *parent = nullptr, int progressEndDelayMs = defaultProgressEndDelayMs);
++
++    std::optional<QString> statusText() const;
++    /** Invalid when there is no indicator. */
++    QColor indicator() const;
++    /** Invalid when there is no status text color. */
++    QColor statusColor() const;
++    std::optional<QString> detail() const;
++    qint64 backgroundTasks() const;
++    std::optional<bool> turnOpen() const;
++
++    /** Whether there is a status to show: an indicator or status text. */
++    bool hasActiveStatus() const;
++    bool hasArmedExpiration() const;
++
++    /**
++     * Applies an update. Returns false when its preconditions did not hold,
++     * in which case nothing changed.
++     */
++    bool apply(const StatusUpdate &update);
++
++    /** The program reported progress with OSC 9;4. */
++    void progressReported(const std::optional<Konsole::TerminalProgress> &progress);
++
++    /** The user pressed a key: a "done" or "error" status has been seen and becomes idle. */
++    void userDidPressKey();
++
++    /** Clears everything. Returns whether there was anything to clear. */
++    bool clearStatus();
++
++    /** The session's program exited: forget the status and the operation. */
++    void programDidExit();
++
++    /**
++     * The status as `it2 set-status --json` and `it2 session get-status`
++     * print it: status, text_color, dot_color, detail (null when unset),
++     * background_tasks and turn_open (null when never reported).
++     */
++    QJsonObject toJson() const;
++
++Q_SIGNALS:
++    /** Something visible changed. */
++    void changed(const std::optional<QString> &previousStatusText);
++
++private:
++    struct Display {
++        QColor indicator;
++        std::optional<QString> statusText;
++        QColor statusColor;
++        std::optional<QString> detail;
++
++        bool operator==(const Display &other) const
++        {
++            return indicator == other.indicator && statusText == other.statusText && statusColor == other.statusColor && detail == other.detail;
++        }
++    };
++
++    bool preconditionsHold(const StatusUpdate &update) const;
++    /** Applies the fields and bookkeeping, returning whether anything visible changed. */
++    bool applyToState(const StatusUpdate &update);
++    bool applyFields(const Konsole::TabStatusFields &fields);
++    void expire(int scheduledGeneration);
++    void expireNow();
++
++    const int _progressEndDelayMs;
++
++    Display _display;
++    qint64 _backgroundTasks = 0;
++    std::optional<bool> _turnOpen;
++
++    // What the current status asked to show when its operation ends.
++    std::optional<Konsole::TabStatusFields> _armedFallback;
++    // Bumped whenever a scheduled expiration stops being valid.
++    int _generation = 0;
++    // Whether the last progress report said something was running; a stop
++    // only ends an operation that was seen to start.
++    bool _progressWasRunning = false;
++    // Whether the head start after the last operation ended has elapsed, and
++    // the generation as of that end.
++    bool _headStartElapsed = false;
++    int _operationEndGeneration = 0;
++};
++
++#endif // SESSIONSTATUS_H
+diff --git a/src/plugins/ClaudeCode/sessionstatusregistry.cpp b/src/plugins/ClaudeCode/sessionstatusregistry.cpp
+new file mode 100644
+index 0000000..bee1f10
+--- /dev/null
++++ b/src/plugins/ClaudeCode/sessionstatusregistry.cpp
+@@ -0,0 +1,69 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "sessionstatusregistry.h"
++#include "sessionstatus.h"
++
++#include "Emulation.h"
++#include "session/Session.h"
++#include "session/SessionManager.h"
++
++SessionStatusRegistry::SessionStatusRegistry(QObject *parent)
++    : QObject(parent)
++{
++    auto *manager = Konsole::SessionManager::instance();
++    const auto existing = manager->sessions();
++    for (Konsole::Session *session : existing) {
++        track(session);
++    }
++    connect(manager, &Konsole::SessionManager::sessionCreated, this, &SessionStatusRegistry::track);
++}
++
++SessionStatus *SessionStatusRegistry::status(Konsole::Session *session) const
++{
++    return _statuses.value(session);
++}
++
++Konsole::Session *SessionStatusRegistry::session(const QString &identifier) const
++{
++    const QLatin1String prefix("/Sessions/");
++    bool ok = false;
++    const int id = (identifier.startsWith(prefix) ? identifier.mid(prefix.size()) : identifier).toInt(&ok);
++    if (!ok) {
++        return nullptr;
++    }
++    for (auto it = _statuses.cbegin(); it != _statuses.cend(); ++it) {
++        if (it.key()->sessionId() == id) {
++            return it.key();
++        }
++    }
++    return nullptr;
++}
++
++QList<Konsole::Session *> SessionStatusRegistry::sessions() const
++{
++    return _statuses.keys();
++}
++
++void SessionStatusRegistry::track(Konsole::Session *session)
++{
++    if (_statuses.contains(session)) {
++        return;
++    }
++    auto *status = new SessionStatus(this);
++    _statuses.insert(session, status);
++
++    connect(session->emulation(), &Konsole::Emulation::progressChanged, status, &SessionStatus::progressReported);
++    connect(session, &Konsole::Session::tabStatusReceived, status, [status](const Konsole::TabStatusUpdate &update) {
++        status->apply(StatusUpdate::fromTabStatus(update));
++    });
++    connect(session, &Konsole::Session::finished, status, &SessionStatus::programDidExit);
++    connect(status, &SessionStatus::changed, this, [this, session] {
++        Q_EMIT statusChanged(session);
++    });
++    connect(session, &QObject::destroyed, this, [this, session] {
++        delete _statuses.take(session);
++    });
++}
++
++#include "moc_sessionstatusregistry.cpp"
+diff --git a/src/plugins/ClaudeCode/sessionstatusregistry.h b/src/plugins/ClaudeCode/sessionstatusregistry.h
+new file mode 100644
+index 0000000..739e3b2
+--- /dev/null
++++ b/src/plugins/ClaudeCode/sessionstatusregistry.h
+@@ -0,0 +1,49 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#ifndef SESSIONSTATUSREGISTRY_H
++#define SESSIONSTATUSREGISTRY_H
++
++#include <QHash>
++#include <QObject>
++
++namespace Konsole
++{
++class Session;
++}
++class SessionStatus;
++
++/**
++ * Keeps a SessionStatus for every Konsole session, from the moment it is
++ * created, and feeds it what the session's program reports: OSC 9;4
++ * progress and OSC 21337 status.
++ */
++class SessionStatusRegistry : public QObject
++{
++    Q_OBJECT
++
++public:
++    explicit SessionStatusRegistry(QObject *parent = nullptr);
++
++    /** The status of @p session, or nullptr for a session that is not tracked. */
++    SessionStatus *status(Konsole::Session *session) const;
++
++    /**
++     * The session named by @p identifier: its D-Bus path (/Sessions/3) or
++     * its number (3). Returns nullptr when there is none.
++     */
++    Konsole::Session *session(const QString &identifier) const;
++
++    QList<Konsole::Session *> sessions() const;
++
++Q_SIGNALS:
++    /** Something visible about @p session's status changed. */
++    void statusChanged(Konsole::Session *session);
++
++private:
++    void track(Konsole::Session *session);
++
++    QHash<Konsole::Session *, SessionStatus *> _statuses;
++};
++
++#endif // SESSIONSTATUSREGISTRY_H
+-- 
+2.56.0
+

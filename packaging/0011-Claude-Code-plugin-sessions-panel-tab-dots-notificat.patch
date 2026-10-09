@@ -1,0 +1,890 @@
+From 8cf7b140ca5fbba567d5dff06aa2f3c43aaea057 Mon Sep 17 00:00:00 2001
+From: Eric Duprey <509630+destinal@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 14:08:34 -0700
+Subject: [PATCH 11/17] Claude Code plugin: sessions panel, tab dots,
+ notifications
+
+- The Claude Sessions panel lists every session that shows a status, in
+  every Konsole window: a dot, the tab title and the status in its color,
+  then the detail. Sessions needing the user come first (waiting, error,
+  done, working, idle), the most recent first among equals. Clicking one
+  brings it forward. The panel starts hidden; the window remembers it.
+- Each session's tab shows its status dot.
+- A session the user is not looking at notifies when it starts waiting
+  (ClaudeCodeWaiting) or finishes or fails (ClaudeCodeFinished), with an
+  action that brings it forward, at most once per event every 10 seconds.
+  Both events are configurable in Konsole's notification settings.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ desktop/konsole.notifyrc                      |  10 ++
+ src/plugins/ClaudeCode/CMakeLists.txt         |   6 +
+ src/plugins/ClaudeCode/claudecodeplugin.cpp   |  37 +++-
+ .../ClaudeCode/claudesessionsmodel.cpp        | 165 ++++++++++++++++++
+ src/plugins/ClaudeCode/claudesessionsmodel.h  |  59 +++++++
+ .../ClaudeCode/claudesessionswidget.cpp       | 123 ++++++++++++-
+ src/plugins/ClaudeCode/claudesessionswidget.h |  21 ++-
+ src/plugins/ClaudeCode/sessionnavigation.cpp  |  60 +++++++
+ src/plugins/ClaudeCode/sessionnavigation.h    |  30 ++++
+ .../ClaudeCode/sessionstatusregistry.cpp      |   4 +-
+ .../ClaudeCode/sessionstatusregistry.h        |   5 +-
+ src/plugins/ClaudeCode/statusnotifier.cpp     |  92 ++++++++++
+ src/plugins/ClaudeCode/statusnotifier.h       |  46 +++++
+ 13 files changed, 642 insertions(+), 16 deletions(-)
+ create mode 100644 src/plugins/ClaudeCode/claudesessionsmodel.cpp
+ create mode 100644 src/plugins/ClaudeCode/claudesessionsmodel.h
+ create mode 100644 src/plugins/ClaudeCode/sessionnavigation.cpp
+ create mode 100644 src/plugins/ClaudeCode/sessionnavigation.h
+ create mode 100644 src/plugins/ClaudeCode/statusnotifier.cpp
+ create mode 100644 src/plugins/ClaudeCode/statusnotifier.h
+
+diff --git a/desktop/konsole.notifyrc b/desktop/konsole.notifyrc
+index ef347fc..fb61916 100644
+--- a/desktop/konsole.notifyrc
++++ b/desktop/konsole.notifyrc
+@@ -1649,3 +1649,13 @@ Comment[uk]=Запит оболонки ініціював сповіщення
+ Comment[zh_CN]=外壳程序的提示触发了一条通知
+ Comment[zh_TW]=shell 提示字元觸發了通知
+ Action=Popup
++
++[Event/ClaudeCodeWaiting]
++Name=Claude Code Needs You
++Comment=A Claude Code session you are not looking at is waiting for you
++Action=Popup
++
++[Event/ClaudeCodeFinished]
++Name=Claude Code Finished
++Comment=A Claude Code session you are not looking at finished or failed
++Action=Popup
+diff --git a/src/plugins/ClaudeCode/CMakeLists.txt b/src/plugins/ClaudeCode/CMakeLists.txt
+index c02979f..2eeb4cb 100644
+--- a/src/plugins/ClaudeCode/CMakeLists.txt
++++ b/src/plugins/ClaudeCode/CMakeLists.txt
+@@ -2,7 +2,10 @@ kcoreaddons_add_plugin(konsole_claudecodeplugin
+ SOURCES
+     claudecodeplugin.cpp
+     claudecodedbus.cpp
++    claudesessionsmodel.cpp
+     claudesessionswidget.cpp
++    sessionnavigation.cpp
++    statusnotifier.cpp
+     programstatusrecords.cpp
+     sessionstatus.cpp
+     sessionstatusregistry.cpp
+@@ -15,6 +18,9 @@ target_link_libraries(konsole_claudecodeplugin
+     konsoleprivate
+     konsoleapp
+     Qt::DBus
++    KF6::I18n
++    KF6::Notifications
++    KF6::WindowSystem
+ )
+ target_compile_definitions(konsole_claudecodeplugin PRIVATE -DRELEASE_SERVICE_VERSION="${RELEASE_SERVICE_VERSION}")
+ 
+diff --git a/src/plugins/ClaudeCode/claudecodeplugin.cpp b/src/plugins/ClaudeCode/claudecodeplugin.cpp
+index b2a9374..1a9b79a 100644
+--- a/src/plugins/ClaudeCode/claudecodeplugin.cpp
++++ b/src/plugins/ClaudeCode/claudecodeplugin.cpp
+@@ -3,13 +3,16 @@
+ 
+ #include "claudecodeplugin.h"
+ #include "claudecodedbus.h"
++#include "claudesessionsmodel.h"
+ #include "claudesessionswidget.h"
+ #include "konsoledebug.h"
+ #include "programstatusrecords.h"
+ #include "sessionstatus.h"
+ #include "sessionstatusregistry.h"
++#include "statusnotifier.h"
+ 
+ #include "MainWindow.h"
++#include "session/Session.h"
+ #include "session/SessionController.h"
+ #include "terminalDisplay/TerminalDisplay.h"
+ 
+@@ -17,11 +20,13 @@
+ #include <KLocalizedString>
+ 
+ #include <QDockWidget>
++#include <QTimer>
+ 
+ K_PLUGIN_CLASS_WITH_JSON(ClaudeCodePlugin, "konsole_claudecode.json")
+ 
+ struct ClaudeCodePlugin::Private {
+     SessionStatusRegistry *registry = nullptr;
++    ClaudeSessionsModel *model = nullptr;
+     QMap<Konsole::MainWindow *, QDockWidget *> dockForWindow;
+ };
+ 
+@@ -32,6 +37,14 @@ ClaudeCodePlugin::ClaudeCodePlugin(QObject *object, const QVariantList &args)
+     setName(QStringLiteral("ClaudeCode"));
+ 
+     priv->registry = new SessionStatusRegistry(this);
++    priv->model = new ClaudeSessionsModel(priv->registry, this);
++    new StatusNotifier(priv->registry, this);
++
++    // The session's tab shows its status as a colored dot.
++    connect(priv->registry, &SessionStatusRegistry::statusChanged, this, [this](Konsole::Session *session) {
++        SessionStatus *status = priv->registry->status(session);
++        session->setStatusIndicator(status != nullptr && status->hasActiveStatus() ? status->indicator() : QColor());
++    });
+     auto *dbus = new ClaudeCodeDBus(priv->registry, this);
+     if (!dbus->registerObject()) {
+         qCWarning(KonsoleDebug) << "Claude Code plugin could not register /ClaudeCode on D-Bus";
+@@ -44,12 +57,24 @@ void ClaudeCodePlugin::createWidgetsForMainWindow(Konsole::MainWindow *mainWindo
+ {
+     auto *dock = new QDockWidget(mainWindow);
+     dock->setWindowTitle(i18n("Claude Sessions"));
+-    dock->setWidget(new ClaudeSessionsWidget(dock));
++    dock->setWidget(new ClaudeSessionsWidget(priv->model, dock));
+     dock->setObjectName(QStringLiteral("ClaudeCodeDock"));
+-    dock->setVisible(false);
+     dock->setAllowedAreas(Qt::DockWidgetArea::LeftDockWidgetArea | Qt::DockWidgetArea::RightDockWidgetArea);
+ 
+     mainWindow->addDockWidget(Qt::RightDockWidgetArea, dock);
++    // Hidden until asked for; adding a dock shows it. The window remembers the
++    // choice from then on.
++    dock->hide();
++    // A dock first shown after its window is laid out comes up at its minimum
++    // width; give it the room it asks for.
++    connect(dock, &QDockWidget::visibilityChanged, dock, [dock, mainWindow](bool visible) {
++        const int wanted = dock->widget()->sizeHint().width();
++        if (visible && dock->width() < wanted) {
++            QTimer::singleShot(0, dock, [dock, mainWindow, wanted] {
++                mainWindow->resizeDocks({dock}, {wanted}, Qt::Horizontal);
++            });
++        }
++    });
+     priv->dockForWindow[mainWindow] = dock;
+     connect(mainWindow, &QObject::destroyed, this, [this, mainWindow] {
+         priv->dockForWindow.remove(mainWindow);
+@@ -78,12 +103,12 @@ void ClaudeCodePlugin::activeViewChanged(Konsole::SessionController *controller,
+ 
+ QList<QAction *> ClaudeCodePlugin::menuBarActions(Konsole::MainWindow *mainWindow) const
+ {
+-    auto *toggleVisibilityAction = new QAction(i18n("Show Claude Sessions"), mainWindow);
+-    toggleVisibilityAction->setCheckable(true);
++    // The dock's own toggle action, which always agrees with whether the dock shows.
++    QDockWidget *dock = priv->dockForWindow[mainWindow];
++    QAction *toggleVisibilityAction = dock->toggleViewAction();
++    toggleVisibilityAction->setText(i18n("Show Claude Sessions"));
+     mainWindow->actionCollection()->addAction(QStringLiteral("claudecode-show-sessions"), toggleVisibilityAction);
+     mainWindow->actionCollection()->setDefaultShortcut(toggleVisibilityAction, QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_F3));
+-    connect(toggleVisibilityAction, &QAction::triggered, priv->dockForWindow[mainWindow], &QDockWidget::setVisible);
+-    connect(priv->dockForWindow[mainWindow], &QDockWidget::visibilityChanged, toggleVisibilityAction, &QAction::setChecked);
+ 
+     return {toggleVisibilityAction};
+ }
+diff --git a/src/plugins/ClaudeCode/claudesessionsmodel.cpp b/src/plugins/ClaudeCode/claudesessionsmodel.cpp
+new file mode 100644
+index 0000000..0acc34f
+--- /dev/null
++++ b/src/plugins/ClaudeCode/claudesessionsmodel.cpp
+@@ -0,0 +1,165 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "claudesessionsmodel.h"
++#include "sessionnavigation.h"
++#include "sessionstatus.h"
++#include "sessionstatusregistry.h"
++
++#include "session/Session.h"
++#include "session/SessionController.h"
++#include "terminalDisplay/TerminalDisplay.h"
++
++#include <QTimer>
++
++#include <algorithm>
++
++ClaudeSessionsModel::ClaudeSessionsModel(SessionStatusRegistry *registry, QObject *parent)
++    : QAbstractListModel(parent)
++    , _registry(registry)
++{
++    connect(_registry, &SessionStatusRegistry::statusChanged, this, [this](Konsole::Session *session) {
++        _changed.insert(session, ++_clock);
++        watch(session);
++        scheduleRefresh();
++    });
++    refresh();
++}
++
++int ClaudeSessionsModel::rowCount(const QModelIndex &parent) const
++{
++    return parent.isValid() ? 0 : _rows.size();
++}
++
++QVariant ClaudeSessionsModel::data(const QModelIndex &index, int role) const
++{
++    Konsole::Session *session = this->session(index);
++    SessionStatus *status = session != nullptr ? _registry->status(session) : nullptr;
++    if (status == nullptr) {
++        return {};
++    }
++    switch (role) {
++    case Qt::DisplayRole:
++        return ClaudeCode::sessionTitle(session);
++    case Qt::ToolTipRole: {
++        QString tip = ClaudeCode::sessionTitle(session) + QLatin1String(" — ") + status->statusText().value_or(QString());
++        if (status->detail().has_value()) {
++            tip += QLatin1Char('\n') + *status->detail();
++        }
++        return tip;
++    }
++    case StatusRole:
++        return status->statusText().value_or(QString());
++    case StatusColorRole:
++        return status->statusColor();
++    case IndicatorRole:
++        return status->indicator();
++    case DetailRole:
++        return status->detail().value_or(QString());
++    case SessionRole:
++        return QVariant::fromValue<QObject *>(session);
++    }
++    return {};
++}
++
++Konsole::Session *ClaudeSessionsModel::session(const QModelIndex &index) const
++{
++    if (!index.isValid() || index.row() >= _rows.size()) {
++        return nullptr;
++    }
++    return _rows.at(index.row());
++}
++
++int ClaudeSessionsModel::priority(const QString &status)
++{
++    const QString lower = status.toLower();
++    if (lower == QLatin1String("waiting")) {
++        return 0;
++    }
++    if (lower == QLatin1String("error")) {
++        return 1;
++    }
++    if (lower == QLatin1String("done")) {
++        return 2;
++    }
++    if (lower == QLatin1String("working")) {
++        return 3;
++    }
++    if (lower == QLatin1String("idle")) {
++        return 4;
++    }
++    return 5;
++}
++
++void ClaudeSessionsModel::watch(Konsole::Session *session)
++{
++    // Titles change outside the status: follow the session and its views.
++    connect(session, &Konsole::Session::sessionAttributeChanged, this, &ClaudeSessionsModel::scheduleRefresh, Qt::UniqueConnection);
++    connect(session, &QObject::destroyed, this, &ClaudeSessionsModel::scheduleRefresh, Qt::UniqueConnection);
++    const auto views = session->views();
++    for (Konsole::TerminalDisplay *view : views) {
++        if (view->sessionController() != nullptr) {
++            connect(view->sessionController(), &Konsole::ViewProperties::titleChanged, this, &ClaudeSessionsModel::scheduleRefresh, Qt::UniqueConnection);
++        }
++    }
++}
++
++void ClaudeSessionsModel::scheduleRefresh()
++{
++    // Coalesce: one status change can bring several signals.
++    if (_refreshScheduled) {
++        return;
++    }
++    _refreshScheduled = true;
++    QTimer::singleShot(0, this, &ClaudeSessionsModel::refresh);
++}
++
++void ClaudeSessionsModel::refresh()
++{
++    _refreshScheduled = false;
++
++    QList<Konsole::Session *> sessions;
++    const auto all = _registry->sessions();
++    // Forget sessions that are gone.
++    _changed.removeIf([&all](const auto &it) {
++        return !all.contains(it.key());
++    });
++    for (Konsole::Session *session : all) {
++        SessionStatus *status = _registry->status(session);
++        if (status != nullptr && status->hasActiveStatus()) {
++            sessions.append(session);
++        }
++    }
++    std::sort(sessions.begin(), sessions.end(), [this](Konsole::Session *a, Konsole::Session *b) {
++        const int pa = priority(_registry->status(a)->statusText().value_or(QString()));
++        const int pb = priority(_registry->status(b)->statusText().value_or(QString()));
++        if (pa != pb) {
++            return pa < pb;
++        }
++        const quint64 ca = _changed.value(a);
++        const quint64 cb = _changed.value(b);
++        if (ca != cb) {
++            return ca > cb;
++        }
++        return a->sessionId() < b->sessionId();
++    });
++
++    QList<Konsole::Session *> current;
++    for (const auto &row : std::as_const(_rows)) {
++        current.append(row.data());
++    }
++    if (current == sessions) {
++        if (!_rows.isEmpty()) {
++            Q_EMIT dataChanged(index(0), index(_rows.size() - 1));
++        }
++        return;
++    }
++    beginResetModel();
++    _rows.clear();
++    for (Konsole::Session *session : std::as_const(sessions)) {
++        _rows.append(session);
++    }
++    endResetModel();
++}
++
++#include "moc_claudesessionsmodel.cpp"
+diff --git a/src/plugins/ClaudeCode/claudesessionsmodel.h b/src/plugins/ClaudeCode/claudesessionsmodel.h
+new file mode 100644
+index 0000000..929b3e7
+--- /dev/null
++++ b/src/plugins/ClaudeCode/claudesessionsmodel.h
+@@ -0,0 +1,59 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#ifndef CLAUDESESSIONSMODEL_H
++#define CLAUDESESSIONSMODEL_H
++
++#include <QAbstractListModel>
++#include <QHash>
++#include <QList>
++#include <QPointer>
++
++namespace Konsole
++{
++class Session;
++}
++class SessionStatusRegistry;
++
++/**
++ * Every session that shows a status, in every Konsole window, the ones that
++ * need the user first: waiting, error, done, working, idle, then anything
++ * else, the most recently changed first among equals.
++ */
++class ClaudeSessionsModel : public QAbstractListModel
++{
++    Q_OBJECT
++
++public:
++    enum Role {
++        StatusRole = Qt::UserRole + 1,
++        StatusColorRole,
++        IndicatorRole,
++        DetailRole,
++        SessionRole,
++    };
++
++    explicit ClaudeSessionsModel(SessionStatusRegistry *registry, QObject *parent = nullptr);
++
++    int rowCount(const QModelIndex &parent = QModelIndex()) const override;
++    QVariant data(const QModelIndex &index, int role) const override;
++
++    Konsole::Session *session(const QModelIndex &index) const;
++
++    /** Sort rank of a status: lower needs the user more. */
++    static int priority(const QString &status);
++
++private:
++    void scheduleRefresh();
++    void refresh();
++    void watch(Konsole::Session *session);
++
++    SessionStatusRegistry *_registry;
++    QList<QPointer<Konsole::Session>> _rows;
++    // When each session's status last changed, for ordering equals.
++    QHash<Konsole::Session *, quint64> _changed;
++    quint64 _clock = 0;
++    bool _refreshScheduled = false;
++};
++
++#endif // CLAUDESESSIONSMODEL_H
+diff --git a/src/plugins/ClaudeCode/claudesessionswidget.cpp b/src/plugins/ClaudeCode/claudesessionswidget.cpp
+index 32842cd..5a10108 100644
+--- a/src/plugins/ClaudeCode/claudesessionswidget.cpp
++++ b/src/plugins/ClaudeCode/claudesessionswidget.cpp
+@@ -2,21 +2,136 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "claudesessionswidget.h"
++#include "claudesessionsmodel.h"
++#include "sessionnavigation.h"
+ 
+ #include <KLocalizedString>
+ 
++#include <QApplication>
+ #include <QLabel>
+-#include <QVBoxLayout>
++#include <QListView>
++#include <QPainter>
++#include <QStackedLayout>
++#include <QStyledItemDelegate>
+ 
+-ClaudeSessionsWidget::ClaudeSessionsWidget(QWidget *parent)
++namespace
++{
++constexpr int padding = 6;
++constexpr int dotDiameter = 9;
++
++// Two lines per session: a dot, its title and its status; then the detail.
++class SessionDelegate : public QStyledItemDelegate
++{
++public:
++    using QStyledItemDelegate::QStyledItemDelegate;
++
++    QSize sizeHint(const QStyleOptionViewItem &option, const QModelIndex &index) const override
++    {
++        Q_UNUSED(index)
++        const QFontMetrics metrics(option.font);
++        return QSize(option.rect.width(), 2 * padding + 2 * metrics.lineSpacing());
++    }
++
++    void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override
++    {
++        QStyleOptionViewItem opt = option;
++        initStyleOption(&opt, index);
++        // The panel's background, selection and hover, without the default text.
++        opt.text.clear();
++        QStyle *style = opt.widget != nullptr ? opt.widget->style() : QApplication::style();
++        style->drawControl(QStyle::CE_ItemViewItem, &opt, painter, opt.widget);
++
++        painter->save();
++        painter->setRenderHint(QPainter::Antialiasing);
++        const QRect area = option.rect.adjusted(padding, padding, -padding, -padding);
++        const QFontMetrics metrics(option.font);
++        const int lineHeight = metrics.lineSpacing();
++        const bool selected = option.state & QStyle::State_Selected;
++        const QPalette::ColorGroup group = option.state & QStyle::State_Enabled ? QPalette::Normal : QPalette::Disabled;
++        const QColor text = option.palette.color(group, selected ? QPalette::HighlightedText : QPalette::Text);
++
++        // Dot.
++        const QColor indicator = index.data(ClaudeSessionsModel::IndicatorRole).value<QColor>();
++        if (indicator.isValid()) {
++            painter->setPen(QPen(indicator.darker(140), 1));
++            painter->setBrush(indicator);
++            painter->drawEllipse(QRectF(area.left(), area.top() + (lineHeight - dotDiameter) / 2.0, dotDiameter, dotDiameter));
++        }
++
++        // Status, right-aligned in its own color.
++        const QString status = index.data(ClaudeSessionsModel::StatusRole).toString();
++        QColor statusColor = index.data(ClaudeSessionsModel::StatusColorRole).value<QColor>();
++        if (!statusColor.isValid() || selected) {
++            statusColor = text;
++        }
++        const int statusWidth = metrics.horizontalAdvance(status);
++        painter->setPen(statusColor);
++        painter->drawText(QRect(area.right() - statusWidth, area.top(), statusWidth, lineHeight), Qt::AlignRight | Qt::AlignVCenter, status);
++
++        // Title, bold, in what is left of the first line.
++        QFont bold = option.font;
++        bold.setBold(true);
++        painter->setFont(bold);
++        painter->setPen(text);
++        const int titleLeft = area.left() + dotDiameter + padding;
++        const QRect titleRect(titleLeft, area.top(), area.right() - statusWidth - padding - titleLeft, lineHeight);
++        painter->drawText(titleRect,
++                          Qt::AlignLeft | Qt::AlignVCenter,
++                          QFontMetrics(bold).elidedText(index.data().toString(), Qt::ElideRight, titleRect.width()));
++
++        // Detail, quieter, on the second line.
++        const QString detail = index.data(ClaudeSessionsModel::DetailRole).toString().simplified();
++        if (!detail.isEmpty()) {
++            painter->setFont(option.font);
++            painter->setPen(option.palette.color(group, selected ? QPalette::HighlightedText : QPalette::PlaceholderText));
++            const QRect detailRect(titleLeft, area.top() + lineHeight, area.right() - titleLeft, lineHeight);
++            painter->drawText(detailRect, Qt::AlignLeft | Qt::AlignVCenter, metrics.elidedText(detail, Qt::ElideRight, detailRect.width()));
++        }
++        painter->restore();
++    }
++};
++}
++
++ClaudeSessionsWidget::ClaudeSessionsWidget(ClaudeSessionsModel *model, QWidget *parent)
+     : QWidget(parent)
++    , _model(model)
++    , _list(new QListView(this))
++    , _stack(new QStackedLayout(this))
+ {
++    _list->setModel(model);
++    _list->setItemDelegate(new SessionDelegate(_list));
++    _list->setSelectionMode(QAbstractItemView::NoSelection);
++    _list->setMouseTracking(true);
++    _list->setUniformItemSizes(true);
++    _list->setFrameShape(QFrame::NoFrame);
++    connect(_list, &QListView::clicked, this, [this](const QModelIndex &index) {
++        if (Konsole::Session *session = _model->session(index)) {
++            ClaudeCode::activateSession(session);
++        }
++    });
++
+     auto *placeholder = new QLabel(i18n("No Claude Code sessions"), this);
+     placeholder->setAlignment(Qt::AlignCenter);
++    placeholder->setWordWrap(true);
+     placeholder->setEnabled(false);
+ 
+-    auto *layout = new QVBoxLayout(this);
+-    layout->addWidget(placeholder);
++    _stack->addWidget(placeholder);
++    _stack->addWidget(_list);
++
++    connect(model, &QAbstractItemModel::modelReset, this, &ClaudeSessionsWidget::updatePlaceholder);
++    connect(model, &QAbstractItemModel::rowsInserted, this, &ClaudeSessionsWidget::updatePlaceholder);
++    connect(model, &QAbstractItemModel::rowsRemoved, this, &ClaudeSessionsWidget::updatePlaceholder);
++    updatePlaceholder();
++}
++
++QSize ClaudeSessionsWidget::sizeHint() const
++{
++    return QSize(fontMetrics().averageCharWidth() * 36, QWidget::sizeHint().height());
++}
++
++void ClaudeSessionsWidget::updatePlaceholder()
++{
++    _stack->setCurrentWidget(_model->rowCount() > 0 ? static_cast<QWidget *>(_list) : _stack->widget(0));
+ }
+ 
+ #include "moc_claudesessionswidget.cpp"
+diff --git a/src/plugins/ClaudeCode/claudesessionswidget.h b/src/plugins/ClaudeCode/claudesessionswidget.h
+index 84e196c..8f2f5ae 100644
+--- a/src/plugins/ClaudeCode/claudesessionswidget.h
++++ b/src/plugins/ClaudeCode/claudesessionswidget.h
+@@ -6,16 +6,31 @@
+ 
+ #include <QWidget>
+ 
++class ClaudeSessionsModel;
++class QListView;
++class QStackedLayout;
++
+ /**
+- * The Claude Sessions panel: every Claude Code session in Konsole, with
+- * its status. Empty for now.
++ * The Claude Sessions panel: every session that shows a status, in every
++ * Konsole window, the ones needing the user first. Clicking a row brings
++ * that session forward.
+  */
+ class ClaudeSessionsWidget : public QWidget
+ {
+     Q_OBJECT
+ 
+ public:
+-    explicit ClaudeSessionsWidget(QWidget *parent = nullptr);
++    explicit ClaudeSessionsWidget(ClaudeSessionsModel *model, QWidget *parent = nullptr);
++
++    /** Wide enough for a tab title and a status side by side. */
++    QSize sizeHint() const override;
++
++private:
++    void updatePlaceholder();
++
++    ClaudeSessionsModel *_model;
++    QListView *_list;
++    QStackedLayout *_stack;
+ };
+ 
+ #endif // CLAUDESESSIONSWIDGET_H
+diff --git a/src/plugins/ClaudeCode/sessionnavigation.cpp b/src/plugins/ClaudeCode/sessionnavigation.cpp
+new file mode 100644
+index 0000000..34d88b2
+--- /dev/null
++++ b/src/plugins/ClaudeCode/sessionnavigation.cpp
+@@ -0,0 +1,60 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "sessionnavigation.h"
++
++#include "MainWindow.h"
++#include "ViewManager.h"
++#include "session/Session.h"
++#include "session/SessionController.h"
++#include "terminalDisplay/TerminalDisplay.h"
++
++#include <KWindowSystem>
++
++#include <QWindow>
++
++namespace ClaudeCode
++{
++void activateSession(Konsole::Session *session, const QString &activationToken)
++{
++    const auto views = session->views();
++    if (views.isEmpty()) {
++        return;
++    }
++    QWidget *window = views.first()->window();
++    if (auto *mainWindow = qobject_cast<Konsole::MainWindow *>(window)) {
++        mainWindow->viewManager()->setCurrentSession(session->sessionId());
++    }
++    window->show();
++    window->raise();
++    if (!activationToken.isEmpty()) {
++        KWindowSystem::setCurrentXdgActivationToken(activationToken);
++    }
++    if (window->windowHandle() != nullptr) {
++        KWindowSystem::activateWindow(window->windowHandle());
++    }
++    window->activateWindow();
++}
++
++bool isSessionFocused(Konsole::Session *session)
++{
++    const auto views = session->views();
++    for (const Konsole::TerminalDisplay *view : views) {
++        if (view->hasFocus() && view->window()->isActiveWindow()) {
++            return true;
++        }
++    }
++    return false;
++}
++
++QString sessionTitle(Konsole::Session *session)
++{
++    const auto views = session->views();
++    for (Konsole::TerminalDisplay *view : views) {
++        if (view->sessionController() != nullptr && !view->sessionController()->title().isEmpty()) {
++            return view->sessionController()->title();
++        }
++    }
++    return session->nameTitle();
++}
++}
+diff --git a/src/plugins/ClaudeCode/sessionnavigation.h b/src/plugins/ClaudeCode/sessionnavigation.h
+new file mode 100644
+index 0000000..e2f67ef
+--- /dev/null
++++ b/src/plugins/ClaudeCode/sessionnavigation.h
+@@ -0,0 +1,30 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#ifndef SESSIONNAVIGATION_H
++#define SESSIONNAVIGATION_H
++
++#include <QString>
++
++namespace Konsole
++{
++class Session;
++}
++
++namespace ClaudeCode
++{
++/**
++ * Brings @p session's window to the front and focuses its view. On Wayland,
++ * @p activationToken (from a notification action, say) lets another window
++ * take focus.
++ */
++void activateSession(Konsole::Session *session, const QString &activationToken = QString());
++
++/** Whether one of @p session's views has focus in the active window. */
++bool isSessionFocused(Konsole::Session *session);
++
++/** The title shown on the session's tab, or its name when it has no view. */
++QString sessionTitle(Konsole::Session *session);
++}
++
++#endif // SESSIONNAVIGATION_H
+diff --git a/src/plugins/ClaudeCode/sessionstatusregistry.cpp b/src/plugins/ClaudeCode/sessionstatusregistry.cpp
+index 610cf22..df4c7d7 100644
+--- a/src/plugins/ClaudeCode/sessionstatusregistry.cpp
++++ b/src/plugins/ClaudeCode/sessionstatusregistry.cpp
+@@ -70,8 +70,8 @@ void SessionStatusRegistry::track(Konsole::Session *session)
+     });
+     connect(session, &Konsole::Session::finished, programStatus, &ProgramStatusController::programExited);
+     connect(session, &Konsole::Session::finished, status, &SessionStatus::programDidExit);
+-    connect(status, &SessionStatus::changed, this, [this, session] {
+-        Q_EMIT statusChanged(session);
++    connect(status, &SessionStatus::changed, this, [this, session](const std::optional<QString> &previousStatusText) {
++        Q_EMIT statusChanged(session, previousStatusText);
+     });
+     connect(session, &QObject::destroyed, this, [this, session] {
+         // The status owns its program status controller.
+diff --git a/src/plugins/ClaudeCode/sessionstatusregistry.h b/src/plugins/ClaudeCode/sessionstatusregistry.h
+index 50ba630..661eed8 100644
+--- a/src/plugins/ClaudeCode/sessionstatusregistry.h
++++ b/src/plugins/ClaudeCode/sessionstatusregistry.h
+@@ -6,6 +6,9 @@
+ 
+ #include <QHash>
+ #include <QObject>
++#include <QString>
++
++#include <optional>
+ 
+ namespace Konsole
+ {
+@@ -42,7 +45,7 @@ public:
+ 
+ Q_SIGNALS:
+     /** Something visible about @p session's status changed. */
+-    void statusChanged(Konsole::Session *session);
++    void statusChanged(Konsole::Session *session, const std::optional<QString> &previousStatusText);
+ 
+ private:
+     void track(Konsole::Session *session);
+diff --git a/src/plugins/ClaudeCode/statusnotifier.cpp b/src/plugins/ClaudeCode/statusnotifier.cpp
+new file mode 100644
+index 0000000..75f17c3
+--- /dev/null
++++ b/src/plugins/ClaudeCode/statusnotifier.cpp
+@@ -0,0 +1,92 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "statusnotifier.h"
++#include "sessionnavigation.h"
++#include "sessionstatus.h"
++#include "sessionstatusregistry.h"
++
++#include "session/Session.h"
++#include "terminalDisplay/TerminalDisplay.h"
++
++#include <KLocalizedString>
++#include <KNotification>
++
++#include <QPointer>
++#include <QWindow>
++
++namespace
++{
++// The same event for the same session is not repeated within this time.
++constexpr qint64 repeatIntervalMs = 10 * 1000;
++}
++
++StatusNotifier::StatusNotifier(SessionStatusRegistry *registry, QObject *parent)
++    : QObject(parent)
++    , _registry(registry)
++{
++    connect(_registry, &SessionStatusRegistry::statusChanged, this, &StatusNotifier::statusChanged);
++}
++
++void StatusNotifier::statusChanged(Konsole::Session *session, const std::optional<QString> &previousStatusText)
++{
++    SessionStatus *status = _registry->status(session);
++    if (status == nullptr) {
++        return;
++    }
++    const QString text = status->statusText().value_or(QString()).toLower();
++    if (text == previousStatusText.value_or(QString()).toLower()) {
++        return;
++    }
++
++    QString event;
++    QString fallbackText;
++    if (text == QLatin1String("waiting")) {
++        event = QStringLiteral("ClaudeCodeWaiting");
++        fallbackText = i18n("Waiting for you");
++    } else if (text == QLatin1String("done")) {
++        event = QStringLiteral("ClaudeCodeFinished");
++        fallbackText = i18n("Finished");
++    } else if (text == QLatin1String("error")) {
++        event = QStringLiteral("ClaudeCodeFinished");
++        fallbackText = i18n("Failed");
++    } else {
++        return;
++    }
++
++    if (ClaudeCode::isSessionFocused(session)) {
++        return;
++    }
++    const auto sent = _sent.constFind(session);
++    if (sent != _sent.cend() && sent->event == event && sent->timer.elapsed() < repeatIntervalMs) {
++        return;
++    }
++    Sent record{event, QElapsedTimer()};
++    record.timer.start();
++    _sent.insert(session, record);
++    connect(
++        session,
++        &QObject::destroyed,
++        this,
++        [this, session] {
++            _sent.remove(session);
++        },
++        Qt::UniqueConnection);
++
++    auto *notification = new KNotification(event, KNotification::CloseWhenWindowActivated);
++    notification->setTitle(i18nc("@title a Claude Code session, named by its tab title", "Claude Code — %1", ClaudeCode::sessionTitle(session)));
++    notification->setText(status->detail().value_or(fallbackText).toHtmlEscaped());
++    const auto views = session->views();
++    if (!views.isEmpty() && views.first()->window()->windowHandle() != nullptr) {
++        notification->setWindow(views.first()->window()->windowHandle());
++    }
++    KNotificationAction *show = notification->addDefaultAction(i18nc("@action bring the session forward", "Show"));
++    connect(show, &KNotificationAction::activated, this, [notification, session = QPointer<Konsole::Session>(session)] {
++        if (session != nullptr) {
++            ClaudeCode::activateSession(session, notification->xdgActivationToken());
++        }
++    });
++    notification->sendEvent();
++}
++
++#include "moc_statusnotifier.cpp"
+diff --git a/src/plugins/ClaudeCode/statusnotifier.h b/src/plugins/ClaudeCode/statusnotifier.h
+new file mode 100644
+index 0000000..e03ffe4
+--- /dev/null
++++ b/src/plugins/ClaudeCode/statusnotifier.h
+@@ -0,0 +1,46 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#ifndef STATUSNOTIFIER_H
++#define STATUSNOTIFIER_H
++
++#include <QElapsedTimer>
++#include <QHash>
++#include <QObject>
++#include <QString>
++
++#include <optional>
++
++namespace Konsole
++{
++class Session;
++}
++class SessionStatusRegistry;
++
++/**
++ * Sends a desktop notification when a session the user is not looking at
++ * starts waiting for them, or finishes or fails: the ClaudeCodeWaiting and
++ * ClaudeCodeFinished events, configurable in Konsole's notification
++ * settings. Clicking it brings the session forward.
++ */
++class StatusNotifier : public QObject
++{
++    Q_OBJECT
++
++public:
++    explicit StatusNotifier(SessionStatusRegistry *registry, QObject *parent = nullptr);
++
++private:
++    void statusChanged(Konsole::Session *session, const std::optional<QString> &previousStatusText);
++
++    struct Sent {
++        QString event;
++        QElapsedTimer timer;
++    };
++
++    SessionStatusRegistry *_registry;
++    // The last notification for each session, to rate-limit repeats.
++    QHash<Konsole::Session *, Sent> _sent;
++};
++
++#endif // STATUSNOTIFIER_H
+-- 
+2.56.0
+

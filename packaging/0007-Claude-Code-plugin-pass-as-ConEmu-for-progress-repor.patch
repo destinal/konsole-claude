@@ -1,0 +1,49 @@
+From f056da46ee2787ad63a80e785a6afc1b4fdb468b Mon Sep 17 00:00:00 2001
+From: Eric Duprey <509630+destinal@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 13:41:07 -0700
+Subject: [PATCH 07/17] Claude Code plugin: pass as ConEmu for progress reports
+
+Claude Code sends OSC 9;4 progress only to terminals it recognizes
+(ConEmu, Ghostty, iTerm2). Without the end of a turn, an interrupt, which
+runs no hook, leaves the status on "working". Set ConEmuANSI=ON in every
+new session so Claude Code reports progress, until Konsole implements
+Claude Code's own status protocol (OSC 7501).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/plugins/ClaudeCode/claudecodeplugin.cpp | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/src/plugins/ClaudeCode/claudecodeplugin.cpp b/src/plugins/ClaudeCode/claudecodeplugin.cpp
+index 0ed8550..79fa73a 100644
+--- a/src/plugins/ClaudeCode/claudecodeplugin.cpp
++++ b/src/plugins/ClaudeCode/claudecodeplugin.cpp
+@@ -9,7 +9,9 @@
+ #include "sessionstatusregistry.h"
+ 
+ #include "MainWindow.h"
++#include "session/Session.h"
+ #include "session/SessionController.h"
++#include "session/SessionManager.h"
+ #include "terminalDisplay/TerminalDisplay.h"
+ 
+ #include <KActionCollection>
+@@ -31,6 +33,15 @@ ClaudeCodePlugin::ClaudeCodePlugin(QObject *object, const QVariantList &args)
+     setName(QStringLiteral("ClaudeCode"));
+ 
+     priv->registry = new SessionStatusRegistry(this);
++
++    // Claude Code reports a turn's start and end with OSC 9;4 progress only to
++    // terminals it recognizes, ConEmu among them; without the end of a turn,
++    // an interrupt (which runs no hook) leaves the status on "working". Until
++    // Konsole speaks Claude Code's own status protocol (OSC 7501), pass as
++    // ConEmu. This must happen before the session's program starts.
++    connect(Konsole::SessionManager::instance(), &Konsole::SessionManager::sessionCreated, this, [](Konsole::Session *session) {
++        session->addEnvironmentEntry(QStringLiteral("ConEmuANSI=ON"));
++    });
+     auto *dbus = new ClaudeCodeDBus(priv->registry, this);
+     if (!dbus->registerObject()) {
+         qCWarning(KonsoleDebug) << "Claude Code plugin could not register /ClaudeCode on D-Bus";
+-- 
+2.56.0
+

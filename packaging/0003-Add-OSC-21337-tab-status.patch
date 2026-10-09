@@ -1,0 +1,522 @@
+From ec4dbd88f695a5caa6cd04e39d9bb07057ba943e Mon Sep 17 00:00:00 2001
+From: Eric Duprey <509630+destinal@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 13:01:31 -0700
+Subject: [PATCH 03/17] Add OSC 21337 tab status
+
+iTerm2 3.7 lets programs report a session's status with OSC 21337, and
+its Claude Code integration uses this to show whether a session is
+working, waiting or idle:
+
+  printf '\e]21337;status=Working;indicator=#ffa500\a'
+
+Konsole now parses the sequence into a TabStatusUpdate and emits
+Session::tabStatusReceived. Parsing follows iTerm2: semicolon-separated
+key=value pairs with \; and \\ escapes; status, indicator, status-color
+and detail fields, where an empty value clears the field; colors as
+#RRGGBB or xterm rgb:R/G/B. With expires-on=progress-end the status lasts
+until the program's OSC 9;4 progress ends, replaced by the then-* fields
+or cleared if there are none.
+
+Konsole does not display the status itself; the signal is for plugins.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/CMakeLists.txt                   |   1 +
+ src/Emulation.h                      |   7 ++
+ src/TabStatus.cpp                    | 154 +++++++++++++++++++++++++++
+ src/TabStatus.h                      |  73 +++++++++++++
+ src/Vt102Emulation.cpp               |   5 +
+ src/Vt102Emulation.h                 |   1 +
+ src/autotests/SessionTest.cpp        |  17 +++
+ src/autotests/SessionTest.h          |   1 +
+ src/autotests/Vt102EmulationTest.cpp |  75 +++++++++++++
+ src/autotests/Vt102EmulationTest.h   |   2 +
+ src/session/Session.cpp              |   1 +
+ src/session/Session.h                |   7 ++
+ 12 files changed, 344 insertions(+)
+ create mode 100644 src/TabStatus.cpp
+ create mode 100644 src/TabStatus.h
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 311e638..f8d72e0 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -183,6 +183,7 @@ set(konsoleprivate_SRCS ${windowadaptors_SRCS}
+                         ShouldApplyProperty.cpp
+                         UnixProcessInfo.cpp
+                         ViewManager.cpp
++                        TabStatus.cpp
+                         ViewProperties.cpp
+                         Vt102Emulation.cpp
+                         KittyKeyMap.cpp
+diff --git a/src/Emulation.h b/src/Emulation.h
+index d774157..0594a4e 100644
+--- a/src/Emulation.h
++++ b/src/Emulation.h
+@@ -16,6 +16,7 @@
+ 
+ // Konsole
+ #include "Enumeration.h"
++#include "TabStatus.h"
+ #include "TerminalProgress.h"
+ #include "konsoleprivate_export.h"
+ #include "terminalDisplay/TerminalDisplay.h"
+@@ -455,6 +456,12 @@ Q_SIGNALS:
+      */
+     void userVarChanged(const QString &name, const QString &value);
+ 
++    /**
++     * Emitted after receiving the iTerm2 escape sequence OSC 21337, which
++     * sets the status shown for the session. See TabStatusUpdate.
++     */
++    void tabStatusReceived(const Konsole::TabStatusUpdate &update);
++
+     /**
+      * Mainly used to communicate dropped lines to active autosave tasks.
+      * Takes into account lines dropped by Screen::addHistLine and Screen::fastAddHistLine.
+diff --git a/src/TabStatus.cpp b/src/TabStatus.cpp
+new file mode 100644
+index 0000000..c38f0a6
+--- /dev/null
++++ b/src/TabStatus.cpp
+@@ -0,0 +1,154 @@
++/*
++    SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#include "TabStatus.h"
++
++#include <QStringList>
++
++#include <algorithm>
++
++using namespace Konsole;
++
++namespace
++{
++bool isHexDigit(QChar ch)
++{
++    return ch.isDigit() || (ch >= QLatin1Char('a') && ch <= QLatin1Char('f')) || (ch >= QLatin1Char('A') && ch <= QLatin1Char('F'));
++}
++
++// Parses an xterm color: #RGB, #RRGGBB (and the 12 and 16 bit forms), or
++// rgb:R/G/B with 1-4 hex digits per component.
++std::optional<QColor> parseColor(const QString &value)
++{
++    if (value.startsWith(QLatin1Char('#'))) {
++        const QColor color = QColor::fromString(value);
++        return color.isValid() ? std::optional<QColor>(color) : std::nullopt;
++    }
++
++    const QLatin1String rgbPrefix("rgb:");
++    if (!value.startsWith(rgbPrefix)) {
++        return std::nullopt;
++    }
++    const auto parts = QStringView(value).mid(rgbPrefix.size()).split(QLatin1Char('/'));
++    if (parts.size() != 3) {
++        return std::nullopt;
++    }
++    float components[3];
++    for (int i = 0; i < 3; i++) {
++        const QStringView part = parts.at(i);
++        if (part.isEmpty() || part.size() > 4 || !std::all_of(part.begin(), part.end(), isHexDigit)) {
++            return std::nullopt;
++        }
++        // A component of n hex digits scales from 0 to 16^n - 1.
++        const float max = float((1u << (4 * part.size())) - 1);
++        components[i] = float(part.toUInt(nullptr, 16)) / max;
++    }
++    return QColor::fromRgbF(components[0], components[1], components[2]);
++}
++
++// Applies one key=value pair to fields. Returns whether it set anything:
++// false for a key that is not a status field, or a color that does not
++// parse. An empty value clears the field.
++bool setField(TabStatusFields &fields, QStringView key, const QString &value)
++{
++    if (key == QLatin1String("status")) {
++        fields.status = value;
++    } else if (key == QLatin1String("detail")) {
++        fields.detail = value;
++    } else if (key == QLatin1String("indicator") || key == QLatin1String("status-color")) {
++        std::optional<QColor> &field = key == QLatin1String("indicator") ? fields.indicator : fields.statusColor;
++        if (value.isEmpty()) {
++            field = QColor();
++        } else {
++            const auto color = parseColor(value);
++            if (!color.has_value()) {
++                return false;
++            }
++            field = color;
++        }
++    } else {
++        return false;
++    }
++    return true;
++}
++}
++
++TabStatusFields TabStatusFields::cleared()
++{
++    TabStatusFields fields;
++    fields.status = QString();
++    fields.indicator = QColor();
++    fields.statusColor = QColor();
++    fields.detail = QString();
++    return fields;
++}
++
++bool TabStatusFields::operator==(const TabStatusFields &other) const
++{
++    return status == other.status && indicator == other.indicator && statusColor == other.statusColor && detail == other.detail;
++}
++
++TabStatusUpdate TabStatusUpdate::fromOsc21337(QStringView payload)
++{
++    // Split on semicolons that are not escaped. "\;" and "\\" stand for a
++    // semicolon and a backslash; any other escape is kept as written.
++    QStringList tokens;
++    QString current;
++    bool escaped = false;
++    for (const QChar ch : payload) {
++        if (escaped) {
++            if (ch != QLatin1Char(';') && ch != QLatin1Char('\\')) {
++                current += QLatin1Char('\\');
++            }
++            current += ch;
++            escaped = false;
++        } else if (ch == QLatin1Char('\\')) {
++            escaped = true;
++        } else if (ch == QLatin1Char(';')) {
++            tokens.append(current);
++            current.clear();
++        } else {
++            current += ch;
++        }
++    }
++    tokens.append(current);
++
++    const QLatin1String thenPrefix("then-");
++    TabStatusUpdate update;
++    TabStatusFields fallback;
++    bool hasFallback = false;
++    for (const QString &token : std::as_const(tokens)) {
++        const qsizetype separator = token.indexOf(QLatin1Char('='));
++        const QStringView key = separator < 0 ? QStringView(token) : QStringView(token).left(separator);
++        const QString value = separator < 0 ? QString() : token.mid(separator + 1);
++
++        if (key == QLatin1String("expires-on")) {
++            if (value == QLatin1String("progress-end")) {
++                update.expiresOnProgressEnd = true;
++            } else if (value.isEmpty()) {
++                update.expiresOnProgressEnd = false;
++            }
++            continue;
++        }
++        // A then- key that sets nothing must not create a fallback, or a
++        // typo would turn "expire and clear" into "expire and do nothing".
++        if (key.startsWith(thenPrefix)) {
++            hasFallback = setField(fallback, key.mid(thenPrefix.size()), value) || hasFallback;
++            continue;
++        }
++        setField(update.fields, key, value);
++    }
++
++    if (update.expiresOnProgressEnd) {
++        update.fallback = hasFallback ? fallback : TabStatusFields::cleared();
++    }
++    return update;
++}
++
++bool TabStatusUpdate::operator==(const TabStatusUpdate &other) const
++{
++    return fields == other.fields && expiresOnProgressEnd == other.expiresOnProgressEnd && fallback == other.fallback;
++}
+diff --git a/src/TabStatus.h b/src/TabStatus.h
+new file mode 100644
+index 0000000..23ce944
+--- /dev/null
++++ b/src/TabStatus.h
+@@ -0,0 +1,73 @@
++/*
++    SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#ifndef TABSTATUS_H
++#define TABSTATUS_H
++
++#include <QColor>
++#include <QMetaType>
++#include <QString>
++#include <QStringView>
++
++#include <optional>
++
++#include "konsoleprivate_export.h"
++
++namespace Konsole
++{
++/**
++ * Fields of a tab status, as set by the iTerm2 escape sequence OSC 21337.
++ *
++ * Each field is std::nullopt when the update leaves it unchanged. A field
++ * that is set but empty (an empty string, an invalid color) clears it.
++ */
++struct KONSOLEPRIVATE_EXPORT TabStatusFields {
++    std::optional<QString> status;
++    std::optional<QColor> indicator;
++    std::optional<QColor> statusColor;
++    std::optional<QString> detail;
++
++    /** Returns fields that clear every part of the status. */
++    static TabStatusFields cleared();
++
++    bool operator==(const TabStatusFields &other) const;
++    bool operator!=(const TabStatusFields &other) const
++    {
++        return !(*this == other);
++    }
++};
++
++/**
++ * A tab status update received through OSC 21337.
++ *
++ * printf '\e]21337;status=Working;indicator=#ffa500\a'
++ *
++ * The payload is semicolon-separated key=value pairs, where "\;" and "\\"
++ * escape a semicolon and a backslash. Keys: status, indicator (a color),
++ * status-color, detail; colors are #RRGGBB or xterm rgb:R/G/B. With
++ * expires-on=progress-end the status holds only until the program's OSC 9;4
++ * progress ends, and then-<key> fields name what replaces it (by default,
++ * nothing: the status is cleared). Unknown keys are ignored.
++ */
++struct KONSOLEPRIVATE_EXPORT TabStatusUpdate {
++    TabStatusFields fields;
++    bool expiresOnProgressEnd = false;
++    /** Applied when the status expires. Only meaningful with expiresOnProgressEnd. */
++    TabStatusFields fallback;
++
++    static TabStatusUpdate fromOsc21337(QStringView payload);
++
++    bool operator==(const TabStatusUpdate &other) const;
++    bool operator!=(const TabStatusUpdate &other) const
++    {
++        return !(*this == other);
++    }
++};
++}
++
++Q_DECLARE_METATYPE(Konsole::TabStatusUpdate)
++
++#endif
+diff --git a/src/Vt102Emulation.cpp b/src/Vt102Emulation.cpp
+index 3773a7d..0d09e81 100644
+--- a/src/Vt102Emulation.cpp
++++ b/src/Vt102Emulation.cpp
+@@ -1872,6 +1872,11 @@ void Vt102Emulation::processSessionAttributeRequest(const int tokenSize, const u
+         return;
+     }
+ 
++    if (attribute == TabStatus) {
++        Q_EMIT tabStatusReceived(TabStatusUpdate::fromOsc21337(value));
++        return;
++    }
++
+     if (attribute == ConEmu) {
+         const auto list = QStringView(value).split(QLatin1Char(';'));
+         if (list.size() >= 2) {
+diff --git a/src/Vt102Emulation.h b/src/Vt102Emulation.h
+index b49cc11..2a9f431 100644
+--- a/src/Vt102Emulation.h
++++ b/src/Vt102Emulation.h
+@@ -202,6 +202,7 @@ private:
+         Image = 1337,
+         // https://conemu.github.io/en/AnsiEscapeCodes.html#ConEmu_specific_OSC
+         ConEmu = 9,
++        TabStatus = 21337,
+     };
+ 
+     ParserStates _state = Ground;
+diff --git a/src/autotests/SessionTest.cpp b/src/autotests/SessionTest.cpp
+index 9059c0e..c681f2f 100644
+--- a/src/autotests/SessionTest.cpp
++++ b/src/autotests/SessionTest.cpp
+@@ -77,6 +77,23 @@ void SessionTest::testUserVars()
+     delete session;
+ }
+ 
++void SessionTest::testTabStatus()
++{
++    auto session = new Session();
++    QSignalSpy received(session, &Session::tabStatusReceived);
++
++    const char sequence[] = "\033]21337;status=Working;expires-on=progress-end;then-status=idle\007";
++    session->emulation()->receiveData(sequence, sizeof(sequence) - 1);
++
++    QCOMPARE(received.count(), 1);
++    const auto update = received.at(0).at(0).value<TabStatusUpdate>();
++    QCOMPARE(update.fields.status, QStringLiteral("Working"));
++    QVERIFY(update.expiresOnProgressEnd);
++    QCOMPARE(update.fallback.status, QStringLiteral("idle"));
++
++    delete session;
++}
++
+ QTEST_MAIN(SessionTest)
+ 
+ #include "moc_SessionTest.cpp"
+diff --git a/src/autotests/SessionTest.h b/src/autotests/SessionTest.h
+index c9f1786..025840e 100644
+--- a/src/autotests/SessionTest.h
++++ b/src/autotests/SessionTest.h
+@@ -19,6 +19,7 @@ private Q_SLOTS:
+     void testNoProfile();
+     void testEmulation();
+     void testUserVars();
++    void testTabStatus();
+ 
+ private:
+ };
+diff --git a/src/autotests/Vt102EmulationTest.cpp b/src/autotests/Vt102EmulationTest.cpp
+index 020e9db..2bc6321 100644
+--- a/src/autotests/Vt102EmulationTest.cpp
++++ b/src/autotests/Vt102EmulationTest.cpp
+@@ -833,6 +833,81 @@ void Vt102EmulationTest::testSetUserVar()
+     QCOMPARE(vars, expected);
+ }
+ 
++void Vt102EmulationTest::testTabStatusParsing()
++{
++    auto parse = [](const char *payload) {
++        return TabStatusUpdate::fromOsc21337(QString::fromUtf8(payload));
++    };
++    auto name = [](const std::optional<QColor> &color) {
++        return color.has_value() ? color->name() : QStringLiteral("unset");
++    };
++
++    // Fields that are set, and fields left alone.
++    auto update = parse("status=Working;indicator=#ffa500");
++    QCOMPARE(update.fields.status, QStringLiteral("Working"));
++    QCOMPARE(name(update.fields.indicator), QStringLiteral("#ffa500"));
++    QVERIFY(!update.fields.statusColor.has_value());
++    QVERIFY(!update.fields.detail.has_value());
++    QVERIFY(!update.expiresOnProgressEnd);
++
++    // An empty value clears a field.
++    update = parse("status=;indicator=");
++    QCOMPARE(update.fields.status, QString());
++    QVERIFY(update.fields.indicator.has_value() && !update.fields.indicator->isValid());
++
++    // "\;" and "\\" are escapes; other backslashes are kept.
++    update = parse("detail=a\\;b\\\\c\\x;status=s");
++    QCOMPARE(update.fields.detail, QStringLiteral("a;b\\c\\x"));
++    QCOMPARE(update.fields.status, QStringLiteral("s"));
++
++    // xterm colors with 1, 2 and 4 hex digits per component.
++    QCOMPARE(name(parse("indicator=rgb:f/8/0").fields.indicator), QStringLiteral("#ff8800"));
++    QCOMPARE(name(parse("indicator=rgb:ff/80/00").fields.indicator), QStringLiteral("#ff8000"));
++    QCOMPARE(name(parse("status-color=rgb:ffff/0000/8080").fields.statusColor), QStringLiteral("#ff0080"));
++
++    // Colors that do not parse leave the field alone; unknown keys are ignored.
++    QVERIFY(!parse("indicator=orange").fields.indicator.has_value());
++    QVERIFY(!parse("indicator=rgb:ff/0x1/00").fields.indicator.has_value());
++    QVERIFY(!parse("indicator=rgb:fffff/0/0").fields.indicator.has_value());
++    QCOMPARE(parse("foo=bar;baz").fields, TabStatusFields());
++
++    // Expiring without then- keys clears everything on expiry.
++    update = parse("status=working;expires-on=progress-end");
++    QVERIFY(update.expiresOnProgressEnd);
++    QCOMPARE(update.fallback, TabStatusFields::cleared());
++
++    // then- keys name what replaces the status.
++    update = parse("status=working;expires-on=progress-end;then-status=idle;then-indicator=#00d75f");
++    QCOMPARE(update.fallback.status, QStringLiteral("idle"));
++    QCOMPARE(name(update.fallback.indicator), QStringLiteral("#00d75f"));
++    QVERIFY(!update.fallback.detail.has_value());
++
++    // A misspelled then- key does not turn "clear" into "do nothing".
++    update = parse("status=working;expires-on=progress-end;then-staus=idle");
++    QCOMPARE(update.fallback, TabStatusFields::cleared());
++}
++
++void Vt102EmulationTest::testTabStatusSequence()
++{
++    TestEmulation em;
++    em.reset();
++    em.setCodec(TestEmulation::Utf8Codec);
++
++    QList<TabStatusUpdate> updates;
++    connect(&em, &Emulation::tabStatusReceived, this, [&updates](const TabStatusUpdate &update) {
++        updates.append(update);
++    });
++
++    const char bel[] = "\033]21337;status=Working;indicator=#ffa500\007";
++    em.receiveData(bel, sizeof(bel) - 1);
++    const char st[] = "\033]21337;status=;indicator=\033\\";
++    em.receiveData(st, sizeof(st) - 1);
++
++    QCOMPARE(updates.size(), 2);
++    QCOMPARE(updates.at(0), TabStatusUpdate::fromOsc21337(u"status=Working;indicator=#ffa500"));
++    QCOMPARE(updates.at(1), TabStatusUpdate::fromOsc21337(u"status=;indicator="));
++}
++
+ QTEST_GUILESS_MAIN(Vt102EmulationTest)
+ 
+ #include "moc_Vt102EmulationTest.cpp"
+diff --git a/src/autotests/Vt102EmulationTest.h b/src/autotests/Vt102EmulationTest.h
+index cb277e1..911dec5 100644
+--- a/src/autotests/Vt102EmulationTest.h
++++ b/src/autotests/Vt102EmulationTest.h
+@@ -46,6 +46,8 @@ private Q_SLOTS:
+ 
+     void testProgressStates();
+     void testSetUserVar();
++    void testTabStatusParsing();
++    void testTabStatusSequence();
+ 
+ private:
+     static void sendAndCompare(TestEmulation *em, const char *input, size_t inputLen, const QString &expectedPrint, const QByteArray &expectedSent);
+diff --git a/src/session/Session.cpp b/src/session/Session.cpp
+index 7b71ffe..5f26081 100644
+--- a/src/session/Session.cpp
++++ b/src/session/Session.cpp
+@@ -130,6 +130,7 @@ Session::Session(QObject *parent)
+     connect(_emulation, &Konsole::Emulation::sessionAttributeChanged, this, &Konsole::Session::setSessionAttribute);
+     connect(_emulation, &Konsole::Emulation::osc777Received, this, &Konsole::Session::handleOsc777);
+     connect(_emulation, &Konsole::Emulation::userVarChanged, this, &Konsole::Session::setUserVar);
++    connect(_emulation, &Konsole::Emulation::tabStatusReceived, this, &Konsole::Session::tabStatusReceived);
+     connect(_emulation, &Konsole::Emulation::bell, this, [this]() {
+         Q_EMIT bellRequest(i18n("Bell in '%1' (Session '%2')", _displayTitle, _nameTitle));
+         this->setPendingNotification(Notification::Bell);
+diff --git a/src/session/Session.h b/src/session/Session.h
+index 3d641d3..0c841fb 100644
+--- a/src/session/Session.h
++++ b/src/session/Session.h
+@@ -27,6 +27,7 @@
+ 
+ // Konsole
+ #include "Shortcut_p.h"
++#include "TabStatus.h"
+ #include "config-konsole.h"
+ #include "containers/ContainerInfo.h"
+ #include "konsoleprivate_export.h"
+@@ -877,6 +878,12 @@ Q_SIGNALS:
+     /** Emitted when a user-defined variable is set to a new value. */
+     void userVarChanged(const QString &name, const QString &value);
+ 
++    /**
++     * Emitted when a program sets the session's status with OSC 21337.
++     * Konsole does not display it; this is for plugins that do.
++     */
++    void tabStatusReceived(const Konsole::TabStatusUpdate &update);
++
+     /** Emitted when the session gets locked / unlocked. */
+     void readOnlyChanged();
+ 
+-- 
+2.56.0
+

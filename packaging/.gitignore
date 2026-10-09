@@ -1,0 +1,7 @@
+# makepkg's work and output
+src/
+pkg/
+*.pkg.tar.zst
+konsole-*.tar.xz
+konsole-*.tar.xz.sig
+*.log

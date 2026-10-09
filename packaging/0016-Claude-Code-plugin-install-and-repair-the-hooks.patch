@@ -1,0 +1,575 @@
+From 48041fc65a4f1ee8f663459fc5dd5395b2e84e48 Mon Sep 17 00:00:00 2001
+From: Eric Duprey <509630+destinal@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 14:54:11 -0700
+Subject: [PATCH 16/17] Claude Code plugin: install and repair the hooks
+
+konsole-claude-setup adds the hooks that drive the plugin to Claude
+Code's settings ($CLAUDE_CONFIG_DIR/settings.json, by default
+~/.claude/settings.json), or removes them, or says whether they are
+there. It only ever touches hooks that run claude-code-hook, replaces a
+hook at an old path instead of adding a second, backs the file up before
+a change and refuses to touch one that is not valid JSON.
+
+The plugin offers Install and Uninstall Claude Code Hooks in its menu,
+and the Claude Sessions panel shows a banner with an Install button while
+they are missing. It watches the settings, so the banner follows changes
+made anywhere, including Claude Code dropping the hooks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/plugins/ClaudeCode/CMakeLists.txt         |  11 ++
+ src/plugins/ClaudeCode/claudecodeplugin.cpp   |  25 ++-
+ src/plugins/ClaudeCode/claudehooks.cpp        | 106 +++++++++++++
+ src/plugins/ClaudeCode/claudehooks.h          |  43 +++++
+ .../ClaudeCode/claudesessionswidget.cpp       |  36 ++++-
+ src/plugins/ClaudeCode/claudesessionswidget.h |   7 +-
+ .../ClaudeCode/setup/konsole-claude-setup.in  | 149 ++++++++++++++++++
+ 7 files changed, 372 insertions(+), 5 deletions(-)
+ create mode 100644 src/plugins/ClaudeCode/claudehooks.cpp
+ create mode 100644 src/plugins/ClaudeCode/claudehooks.h
+ create mode 100644 src/plugins/ClaudeCode/setup/konsole-claude-setup.in
+
+diff --git a/src/plugins/ClaudeCode/CMakeLists.txt b/src/plugins/ClaudeCode/CMakeLists.txt
+index 17390d0..86e0caa 100644
+--- a/src/plugins/ClaudeCode/CMakeLists.txt
++++ b/src/plugins/ClaudeCode/CMakeLists.txt
+@@ -2,6 +2,7 @@ kcoreaddons_add_plugin(konsole_claudecodeplugin
+ SOURCES
+     claudecodeplugin.cpp
+     claudecodedbus.cpp
++    claudehooks.cpp
+     claudesessionsmodel.cpp
+     claudesessionswidget.cpp
+     clippingstore.cpp
+@@ -27,6 +28,7 @@ target_link_libraries(konsole_claudecodeplugin
+     KF6::ConfigCore
+     KF6::I18n
+     KF6::Notifications
++    KF6::WidgetsAddons
+     KF6::WindowSystem
+ )
+ target_compile_definitions(konsole_claudecodeplugin PRIVATE
+@@ -40,6 +42,15 @@ foreach(file claudecode-diff claudecode-review review-prompt.txt code-review-sys
+     configure_file(workgroup/${file} ${CMAKE_BINARY_DIR}/bin/claudecode/${file} COPYONLY)
+ endforeach()
+ install(PROGRAMS workgroup/claudecode-diff workgroup/claudecode-review DESTINATION ${KDE_INSTALL_LIBEXECDIR}/konsole-claudecode)
++# konsole-claude-setup adds the hooks to Claude Code's settings. The build
++# tree's copy points at the build tree's hook.
++set(CLAUDECODE_TOOLS_DIRECTORY ${CMAKE_BINARY_DIR}/bin/claudecode)
++configure_file(setup/konsole-claude-setup.in ${CMAKE_BINARY_DIR}/bin/claudecode/konsole-claude-setup @ONLY
++               FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
++set(CLAUDECODE_TOOLS_DIRECTORY ${KDE_INSTALL_FULL_LIBEXECDIR}/konsole-claudecode)
++configure_file(setup/konsole-claude-setup.in ${CMAKE_CURRENT_BINARY_DIR}/konsole-claude-setup @ONLY)
++install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/konsole-claude-setup DESTINATION ${KDE_INSTALL_BINDIR})
++
+ install(FILES workgroup/review-prompt.txt workgroup/code-review-system-prompt.txt workgroup/code-review-settings.json
+         DESTINATION ${KDE_INSTALL_LIBEXECDIR}/konsole-claudecode)
+ 
+diff --git a/src/plugins/ClaudeCode/claudecodeplugin.cpp b/src/plugins/ClaudeCode/claudecodeplugin.cpp
+index 550eb70..a524790 100644
+--- a/src/plugins/ClaudeCode/claudecodeplugin.cpp
++++ b/src/plugins/ClaudeCode/claudecodeplugin.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "claudecodeplugin.h"
+ #include "claudecodedbus.h"
++#include "claudehooks.h"
+ #include "claudesessionsmodel.h"
+ #include "claudesessionswidget.h"
+ #include "clippingstore.h"
+@@ -24,6 +25,7 @@
+ 
+ #include <KActionCollection>
+ #include <KLocalizedString>
++#include <KMessageBox>
+ 
+ #include <QDockWidget>
+ #include <QTimer>
+@@ -36,6 +38,7 @@ struct ClaudeCodePlugin::Private {
+     StatusBadges *badges = nullptr;
+     WorkgroupManager *workgroups = nullptr;
+     ClippingStore *clippings = nullptr;
++    ClaudeHooks *hooks = nullptr;
+     QMap<Konsole::MainWindow *, QDockWidget *> dockForWindow;
+     QMap<Konsole::MainWindow *, QDockWidget *> clippingsDockForWindow;
+     QMap<Konsole::MainWindow *, ClippingsWidget *> clippingsForWindow;
+@@ -52,6 +55,7 @@ ClaudeCodePlugin::ClaudeCodePlugin(QObject *object, const QVariantList &args)
+     new StatusNotifier(priv->registry, this);
+     priv->badges = new StatusBadges(priv->registry, this);
+     priv->clippings = new ClippingStore(this);
++    priv->hooks = new ClaudeHooks(this);
+     priv->workgroups = new WorkgroupManager(priv->registry, priv->clippings, this);
+ 
+     // New findings bring up the Clippings panel of each window showing them.
+@@ -80,7 +84,7 @@ void ClaudeCodePlugin::createWidgetsForMainWindow(Konsole::MainWindow *mainWindo
+ {
+     auto *dock = new QDockWidget(mainWindow);
+     dock->setWindowTitle(i18n("Claude Sessions"));
+-    dock->setWidget(new ClaudeSessionsWidget(priv->model, dock));
++    dock->setWidget(new ClaudeSessionsWidget(priv->model, priv->hooks, dock));
+     dock->setObjectName(QStringLiteral("ClaudeCodeDock"));
+     dock->setAllowedAreas(Qt::DockWidgetArea::LeftDockWidgetArea | Qt::DockWidgetArea::RightDockWidgetArea);
+ 
+@@ -220,8 +224,25 @@ QList<QAction *> ClaudeCodePlugin::menuBarActions(Konsole::MainWindow *mainWindo
+     connect(autoEnterAction, &QAction::toggled, priv->workgroups, &WorkgroupManager::setAutoEnter);
+     connect(priv->workgroups, &WorkgroupManager::autoEnterChanged, autoEnterAction, &QAction::setChecked);
+ 
++    // Add or remove the hooks in Claude Code's settings, telling the user how it went.
++    auto hookAction = [this, mainWindow](const QString &text, const QString &name, const QString &command) {
++        auto *action = new QAction(text, mainWindow);
++        mainWindow->actionCollection()->addAction(name, action);
++        connect(action, &QAction::triggered, this, [this, mainWindow, command] {
++            QString output;
++            if (priv->hooks->run(command, &output)) {
++                KMessageBox::information(mainWindow, output, i18n("Claude Code Hooks"));
++            } else {
++                KMessageBox::error(mainWindow, output, i18n("Claude Code Hooks"));
++            }
++        });
++        return action;
++    };
++    QAction *installHooks = hookAction(i18n("Install Claude Code Hooks"), QStringLiteral("claudecode-install-hooks"), QStringLiteral("install"));
++    QAction *uninstallHooks = hookAction(i18n("Uninstall Claude Code Hooks"), QStringLiteral("claudecode-uninstall-hooks"), QStringLiteral("uninstall"));
++
+     return QList<QAction *>{toggleVisibilityAction, clippingsAction, badgesAction, enterAction, exitAction} + memberActions
+-        + QList<QAction *>{autoEnterAction, autoSendAction};
++        + QList<QAction *>{autoEnterAction, autoSendAction, installHooks, uninstallHooks};
+ }
+ 
+ #include "claudecodeplugin.moc"
+diff --git a/src/plugins/ClaudeCode/claudehooks.cpp b/src/plugins/ClaudeCode/claudehooks.cpp
+new file mode 100644
+index 0000000..4c236b2
+--- /dev/null
++++ b/src/plugins/ClaudeCode/claudehooks.cpp
+@@ -0,0 +1,106 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "claudehooks.h"
++#include "workgroupmanager.h"
++
++#include <QDir>
++#include <QFile>
++#include <QFileInfo>
++#include <QFileSystemWatcher>
++#include <QJsonArray>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QProcess>
++#include <QStandardPaths>
++
++namespace
++{
++// The events konsole-claude-setup hooks.
++const QStringList events = {QStringLiteral("UserPromptSubmit"),
++                            QStringLiteral("Stop"),
++                            QStringLiteral("StopFailure"),
++                            QStringLiteral("Notification"),
++                            QStringLiteral("PermissionRequest"),
++                            QStringLiteral("SessionEnd"),
++                            QStringLiteral("PreToolUse"),
++                            QStringLiteral("PostToolUse"),
++                            QStringLiteral("SessionStart"),
++                            QStringLiteral("SubagentStop")};
++
++QString setupProgram()
++{
++    // A build tree keeps it with the other tools; an installation, on PATH.
++    const QString beside = WorkgroupManager::toolsDirectory() + QLatin1String("/konsole-claude-setup");
++    if (QFileInfo(beside).isExecutable()) {
++        return beside;
++    }
++    return QStandardPaths::findExecutable(QStringLiteral("konsole-claude-setup"));
++}
++}
++
++ClaudeHooks::ClaudeHooks(QObject *parent)
++    : QObject(parent)
++    , _watcher(new QFileSystemWatcher(this))
++{
++    // The directory, not the file: Claude Code and the setup replace the file
++    // by renaming a new one over it, which a watch on the file would lose.
++    QDir().mkpath(QFileInfo(settingsPath()).path());
++    _watcher->addPath(QFileInfo(settingsPath()).path());
++    connect(_watcher, &QFileSystemWatcher::directoryChanged, this, &ClaudeHooks::check);
++    check();
++}
++
++QString ClaudeHooks::settingsPath() const
++{
++    QString directory = qEnvironmentVariable("CLAUDE_CONFIG_DIR");
++    if (directory.isEmpty()) {
++        directory = QDir::homePath() + QLatin1String("/.claude");
++    }
++    return directory + QLatin1String("/settings.json");
++}
++
++bool ClaudeHooks::isInstalled() const
++{
++    return _installed;
++}
++
++void ClaudeHooks::check()
++{
++    QFile file(settingsPath());
++    bool installed = false;
++    if (file.open(QIODevice::ReadOnly)) {
++        const QJsonObject hooks = QJsonDocument::fromJson(file.readAll()).object().value(QStringLiteral("hooks")).toObject();
++        installed = std::all_of(events.begin(), events.end(), [&hooks](const QString &event) {
++            const QJsonArray groups = hooks.value(event).toArray();
++            return std::any_of(groups.begin(), groups.end(), [](const QJsonValue &group) {
++                const QJsonArray entries = group.toObject().value(QStringLiteral("hooks")).toArray();
++                return std::any_of(entries.begin(), entries.end(), [](const QJsonValue &entry) {
++                    return entry.toObject().value(QStringLiteral("command")).toString().contains(QLatin1String("claude-code-hook"));
++                });
++            });
++        });
++    }
++    if (installed != _installed) {
++        _installed = installed;
++        Q_EMIT installedChanged(installed);
++    }
++}
++
++bool ClaudeHooks::run(const QString &command, QString *output)
++{
++    const QString program = setupProgram();
++    if (program.isEmpty()) {
++        *output = QStringLiteral("konsole-claude-setup is not installed.");
++        return false;
++    }
++    QProcess process;
++    process.setProcessChannelMode(QProcess::MergedChannels);
++    process.start(program, {command});
++    const bool finished = process.waitForFinished(10000);
++    *output = QString::fromUtf8(process.readAll()).trimmed();
++    check();
++    return finished && process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0;
++}
++
++#include "moc_claudehooks.cpp"
+diff --git a/src/plugins/ClaudeCode/claudehooks.h b/src/plugins/ClaudeCode/claudehooks.h
+new file mode 100644
+index 0000000..df0b218
+--- /dev/null
++++ b/src/plugins/ClaudeCode/claudehooks.h
+@@ -0,0 +1,43 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#ifndef CLAUDEHOOKS_H
++#define CLAUDEHOOKS_H
++
++#include <QObject>
++#include <QString>
++
++class QFileSystemWatcher;
++
++/**
++ * Whether Claude Code's settings run claude-code-hook for every event it
++ * needs, and the means to change that, through konsole-claude-setup. The
++ * settings are watched, so a change made elsewhere shows at once.
++ *
++ * Without the hooks, sessions still show what Claude Code reports itself
++ * (OSC 7501), but not what the hooks add: detail lines and background work.
++ */
++class ClaudeHooks : public QObject
++{
++    Q_OBJECT
++
++public:
++    explicit ClaudeHooks(QObject *parent = nullptr);
++
++    bool isInstalled() const;
++    QString settingsPath() const;
++
++    /** Runs konsole-claude-setup @p command; returns its output, or an error. */
++    bool run(const QString &command, QString *output);
++
++Q_SIGNALS:
++    void installedChanged(bool installed);
++
++private:
++    void check();
++
++    QFileSystemWatcher *_watcher;
++    bool _installed = false;
++};
++
++#endif // CLAUDEHOOKS_H
+diff --git a/src/plugins/ClaudeCode/claudesessionswidget.cpp b/src/plugins/ClaudeCode/claudesessionswidget.cpp
+index 5a10108..164f045 100644
+--- a/src/plugins/ClaudeCode/claudesessionswidget.cpp
++++ b/src/plugins/ClaudeCode/claudesessionswidget.cpp
+@@ -2,10 +2,12 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "claudesessionswidget.h"
++#include "claudehooks.h"
+ #include "claudesessionsmodel.h"
+ #include "sessionnavigation.h"
+ 
+ #include <KLocalizedString>
++#include <KMessageWidget>
+ 
+ #include <QApplication>
+ #include <QLabel>
+@@ -13,6 +15,7 @@
+ #include <QPainter>
+ #include <QStackedLayout>
+ #include <QStyledItemDelegate>
++#include <QVBoxLayout>
+ 
+ namespace
+ {
+@@ -92,12 +95,30 @@ public:
+ };
+ }
+ 
+-ClaudeSessionsWidget::ClaudeSessionsWidget(ClaudeSessionsModel *model, QWidget *parent)
++ClaudeSessionsWidget::ClaudeSessionsWidget(ClaudeSessionsModel *model, ClaudeHooks *hooks, QWidget *parent)
+     : QWidget(parent)
+     , _model(model)
++    , _hooks(hooks)
++    , _hooksBanner(new KMessageWidget(this))
+     , _list(new QListView(this))
+-    , _stack(new QStackedLayout(this))
++    , _stack(new QStackedLayout())
+ {
++    // Offer the hooks when they are missing; they are what fills in details
++    // and background work.
++    _hooksBanner->setMessageType(KMessageWidget::Information);
++    _hooksBanner->setWordWrap(true);
++    _hooksBanner->setText(i18n("Install the Claude Code hooks to see what Claude is doing in more detail, including background work."));
++    auto *install = new QAction(QIcon::fromTheme(QStringLiteral("run-install")), i18n("Install Hooks"), _hooksBanner);
++    connect(install, &QAction::triggered, this, [this] {
++        QString output;
++        if (!_hooks->run(QStringLiteral("install"), &output)) {
++            _hooksBanner->setMessageType(KMessageWidget::Error);
++            _hooksBanner->setText(output);
++        }
++    });
++    _hooksBanner->addAction(install);
++    connect(_hooks, &ClaudeHooks::installedChanged, this, &ClaudeSessionsWidget::updateHooksBanner);
++
+     _list->setModel(model);
+     _list->setItemDelegate(new SessionDelegate(_list));
+     _list->setSelectionMode(QAbstractItemView::NoSelection);
+@@ -118,6 +139,12 @@ ClaudeSessionsWidget::ClaudeSessionsWidget(ClaudeSessionsModel *model, QWidget *
+     _stack->addWidget(placeholder);
+     _stack->addWidget(_list);
+ 
++    auto *layout = new QVBoxLayout(this);
++    layout->setContentsMargins(0, 0, 0, 0);
++    layout->addWidget(_hooksBanner);
++    layout->addLayout(_stack, 1);
++    updateHooksBanner();
++
+     connect(model, &QAbstractItemModel::modelReset, this, &ClaudeSessionsWidget::updatePlaceholder);
+     connect(model, &QAbstractItemModel::rowsInserted, this, &ClaudeSessionsWidget::updatePlaceholder);
+     connect(model, &QAbstractItemModel::rowsRemoved, this, &ClaudeSessionsWidget::updatePlaceholder);
+@@ -129,6 +156,11 @@ QSize ClaudeSessionsWidget::sizeHint() const
+     return QSize(fontMetrics().averageCharWidth() * 36, QWidget::sizeHint().height());
+ }
+ 
++void ClaudeSessionsWidget::updateHooksBanner()
++{
++    _hooksBanner->setVisible(!_hooks->isInstalled());
++}
++
+ void ClaudeSessionsWidget::updatePlaceholder()
+ {
+     _stack->setCurrentWidget(_model->rowCount() > 0 ? static_cast<QWidget *>(_list) : _stack->widget(0));
+diff --git a/src/plugins/ClaudeCode/claudesessionswidget.h b/src/plugins/ClaudeCode/claudesessionswidget.h
+index 8f2f5ae..6ce53b8 100644
+--- a/src/plugins/ClaudeCode/claudesessionswidget.h
++++ b/src/plugins/ClaudeCode/claudesessionswidget.h
+@@ -6,7 +6,9 @@
+ 
+ #include <QWidget>
+ 
++class ClaudeHooks;
+ class ClaudeSessionsModel;
++class KMessageWidget;
+ class QListView;
+ class QStackedLayout;
+ 
+@@ -20,15 +22,18 @@ class ClaudeSessionsWidget : public QWidget
+     Q_OBJECT
+ 
+ public:
+-    explicit ClaudeSessionsWidget(ClaudeSessionsModel *model, QWidget *parent = nullptr);
++    ClaudeSessionsWidget(ClaudeSessionsModel *model, ClaudeHooks *hooks, QWidget *parent = nullptr);
+ 
+     /** Wide enough for a tab title and a status side by side. */
+     QSize sizeHint() const override;
+ 
+ private:
+     void updatePlaceholder();
++    void updateHooksBanner();
+ 
+     ClaudeSessionsModel *_model;
++    ClaudeHooks *_hooks;
++    KMessageWidget *_hooksBanner;
+     QListView *_list;
+     QStackedLayout *_stack;
+ };
+diff --git a/src/plugins/ClaudeCode/setup/konsole-claude-setup.in b/src/plugins/ClaudeCode/setup/konsole-claude-setup.in
+new file mode 100644
+index 0000000..cc9f1ba
+--- /dev/null
++++ b/src/plugins/ClaudeCode/setup/konsole-claude-setup.in
+@@ -0,0 +1,149 @@
++#!/usr/bin/python3
++# SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++# SPDX-License-Identifier: GPL-2.0-or-later
++"""Add or remove the Claude Code hooks that drive Konsole's Claude Code plugin.
++
++    konsole-claude-setup install     add the hooks to Claude Code's settings
++    konsole-claude-setup uninstall   remove them
++    konsole-claude-setup status      say whether they are installed
++
++The settings are $CLAUDE_CONFIG_DIR/settings.json, by default
++~/.claude/settings.json. A copy of the file is kept next to it before any
++change. Only hooks that run claude-code-hook are ever added or removed.
++"""
++
++import json
++import os
++import shutil
++import sys
++import tempfile
++import time
++
++HOOK = "@CLAUDECODE_TOOLS_DIRECTORY@/claude-code-hook"
++
++# The events iTerm2's integration hooks, which cc-status handles.
++EVENTS = [
++    "UserPromptSubmit",
++    "Stop",
++    "StopFailure",
++    "Notification",
++    "PermissionRequest",
++    "SessionEnd",
++    "PreToolUse",
++    "PostToolUse",
++    "SessionStart",
++    "SubagentStop",
++]
++
++
++def settings_path():
++    directory = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
++    return os.path.join(directory, "settings.json")
++
++
++def load(path):
++    try:
++        with open(path, encoding="utf-8") as f:
++            return json.load(f)
++    except FileNotFoundError:
++        return {}
++
++
++def is_ours(hook):
++    return isinstance(hook, dict) and "claude-code-hook" in str(hook.get("command", ""))
++
++
++def without_ours(groups):
++    """The event's matcher groups with our hooks taken out, dropping groups left empty."""
++    kept = []
++    for group in groups:
++        hooks = [h for h in group.get("hooks", []) if not is_ours(h)]
++        if hooks:
++            kept.append({**group, "hooks": hooks})
++        elif not any(is_ours(h) for h in group.get("hooks", [])):
++            kept.append(group)
++    return kept
++
++
++def installed_events(settings):
++    hooks = settings.get("hooks", {})
++    return [e for e in EVENTS if any(is_ours(h) for g in hooks.get(e, []) for h in g.get("hooks", []))]
++
++
++def save(path, settings):
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    if os.path.exists(path):
++        shutil.copy2(path, f"{path}.konsole-claude-{time.strftime('%Y%m%d-%H%M%S')}.bak")
++    # Write and rename, so Claude Code never reads a half-written file.
++    fd, temporary = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".settings.", suffix=".json")
++    with os.fdopen(fd, "w", encoding="utf-8") as f:
++        json.dump(settings, f, indent=2)
++        f.write("\n")
++    if os.path.exists(path):
++        shutil.copymode(path, temporary)
++    os.replace(temporary, path)
++
++
++def install(path):
++    settings = load(path)
++    before = json.dumps(settings, sort_keys=True)
++    hooks = settings.setdefault("hooks", {})
++    for event in EVENTS:
++        # Replace rather than add, so a moved hook is repaired, not doubled.
++        groups = without_ours(hooks.get(event, []))
++        groups.append({"hooks": [{"type": "command", "command": HOOK}]})
++        hooks[event] = groups
++    if json.dumps(settings, sort_keys=True) == before:
++        print(f"Already installed in {path}")
++        return 0
++    save(path, settings)
++    print(f"Installed the Claude Code hooks for Konsole in {path}")
++    return 0
++
++
++def uninstall(path):
++    settings = load(path)
++    if not installed_events(settings):
++        print(f"Not installed in {path}")
++        return 0
++    hooks = settings.get("hooks", {})
++    for event in list(hooks):
++        groups = without_ours(hooks[event])
++        if groups:
++            hooks[event] = groups
++        else:
++            del hooks[event]
++    if not hooks:
++        settings.pop("hooks", None)
++    save(path, settings)
++    print(f"Removed the Claude Code hooks for Konsole from {path}")
++    return 0
++
++
++def status(path):
++    events = installed_events(load(path))
++    if len(events) == len(EVENTS):
++        print(f"Installed in {path}")
++        return 0
++    if events:
++        missing = ", ".join(e for e in EVENTS if e not in events)
++        print(f"Partly installed in {path}; missing: {missing}. Run: konsole-claude-setup install")
++        return 2
++    print(f"Not installed in {path}. Run: konsole-claude-setup install")
++    return 1
++
++
++def main():
++    commands = {"install": install, "uninstall": uninstall, "status": status}
++    if len(sys.argv) != 2 or sys.argv[1] not in commands:
++        print(__doc__.strip(), file=sys.stderr)
++        return 64
++    try:
++        return commands[sys.argv[1]](settings_path())
++    except json.JSONDecodeError as error:
++        print(f"{settings_path()} is not valid JSON ({error}); not changing it.", file=sys.stderr)
++        return 65
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+-- 
+2.56.0
+

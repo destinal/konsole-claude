@@ -1,0 +1,197 @@
+From 35893d4cd1f5089e36cb71bc0ca2bfa8b593f661 Mon Sep 17 00:00:00 2001
+From: Eric Duprey <509630+destinal@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 15:17:13 -0700
+Subject: [PATCH 17/17] Mark the parts that come from iTerm2 GPL-2.0-only
+
+iTerm2 is GPL-2.0 without "or later", so the files ported from it are
+GPL-2.0-only, crediting George Nachman and the iTerm2 authors: the
+status model and program status records with their tests, the OSC 21337
+parser, the Diff member's waiting message and the code review prompts.
+The plugin's README lists them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/TabStatus.cpp                             |  5 ++-
+ src/TabStatus.h                               |  5 ++-
+ src/plugins/ClaudeCode/README.md              | 31 +++++++++++++++++++
+ .../autotests/ProgramStatusRecordsTest.cpp    |  5 ++-
+ .../autotests/SessionStatusTest.cpp           |  5 ++-
+ .../ClaudeCode/programstatusrecords.cpp       |  5 ++-
+ src/plugins/ClaudeCode/programstatusrecords.h |  5 ++-
+ src/plugins/ClaudeCode/sessionstatus.cpp      |  5 ++-
+ src/plugins/ClaudeCode/sessionstatus.h        |  5 ++-
+ .../ClaudeCode/workgroup/claudecode-diff      |  5 ++-
+ 10 files changed, 67 insertions(+), 9 deletions(-)
+ create mode 100644 src/plugins/ClaudeCode/README.md
+
+diff --git a/src/TabStatus.cpp b/src/TabStatus.cpp
+index c38f0a6..2d266a0 100644
+--- a/src/TabStatus.cpp
++++ b/src/TabStatus.cpp
+@@ -1,7 +1,10 @@
+ /*
+     SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++    SPDX-FileCopyrightText: George Nachman and the iTerm2 authors
+ 
+-    SPDX-License-Identifier: GPL-2.0-or-later
++    SPDX-License-Identifier: GPL-2.0-only
++
++    Ported from iTerm2's OSC 21337 parser in VT100Terminal.m.
+ */
+ 
+ #include "TabStatus.h"
+diff --git a/src/TabStatus.h b/src/TabStatus.h
+index 23ce944..3171b67 100644
+--- a/src/TabStatus.h
++++ b/src/TabStatus.h
+@@ -1,7 +1,10 @@
+ /*
+     SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++    SPDX-FileCopyrightText: George Nachman and the iTerm2 authors
+ 
+-    SPDX-License-Identifier: GPL-2.0-or-later
++    SPDX-License-Identifier: GPL-2.0-only
++
++    Ported from iTerm2's OSC 21337 parser in VT100Terminal.m.
+ */
+ 
+ #ifndef TABSTATUS_H
+diff --git a/src/plugins/ClaudeCode/README.md b/src/plugins/ClaudeCode/README.md
+new file mode 100644
+index 0000000..91cfbc7
+--- /dev/null
++++ b/src/plugins/ClaudeCode/README.md
+@@ -0,0 +1,31 @@
++# Claude Code plugin for Konsole
++
++Shows what Claude Code is doing in each Konsole session, modeled on iTerm2's
++Claude Code integration: a sessions panel, status dots on tabs, desktop
++notifications, optional badges, workgroups (Chat, Diff and Code Review) and
++code review clippings. It is driven by iTerm2's own Claude Code hook,
++`cc-status`, through `it2` (a stand-in for iTerm2's command of that name), and
++by Claude Code's Program Status Protocol reports (OSC 7501).
++
++## Credits and licenses
++
++Most of the plugin is GPL-2.0-or-later, like Konsole. These parts come from
++[iTerm2](https://github.com/gnachman/iTerm2) (George Nachman and the iTerm2
++authors), which is GPL-2.0, and are GPL-2.0-only:
++
++| File | From iTerm2 |
++| --- | --- |
++| `sessionstatus.h`, `sessionstatus.cpp` | Ported from `iTermSessionTabStatus.swift`, `iTermTabStatusController.swift`, `SetStatusBuiltInFunction.swift` |
++| `programstatusrecords.h`, `programstatusrecords.cpp` | Ported from `iTermProgramStatus.swift` |
++| `autotests/SessionStatusTest.cpp`, `autotests/ProgramStatusRecordsTest.cpp` | Ported from iTerm2's tests of the above |
++| `workgroup/claudecode-diff` | The waiting message from `DiffWaitingPromptView.swift` |
++| `workgroup/review-prompt.txt` | iTerm2's default code review prompt |
++| `workgroup/code-review-system-prompt.txt` | iTerm2's `code-review-system-prompt.txt`, first line adapted |
++| `workgroup/code-review-settings.json` | Adapted from iTerm2's `code-review-settings.txt` |
++
++Konsole's `src/TabStatus.h` and `src/TabStatus.cpp` (OSC 21337) follow iTerm2's
++parser and are GPL-2.0-only for the same reason. `cc-status` itself is not part
++of this tree; it is built from iTerm2's source.
++
++The Program Status Protocol is specified at
++<https://www.superlogical.com/rex/docs/build/program-status>.
+diff --git a/src/plugins/ClaudeCode/autotests/ProgramStatusRecordsTest.cpp b/src/plugins/ClaudeCode/autotests/ProgramStatusRecordsTest.cpp
+index bfd03a6..ab83c3c 100644
+--- a/src/plugins/ClaudeCode/autotests/ProgramStatusRecordsTest.cpp
++++ b/src/plugins/ClaudeCode/autotests/ProgramStatusRecordsTest.cpp
+@@ -1,5 +1,8 @@
+ // SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
+-// SPDX-License-Identifier: GPL-2.0-or-later
++// SPDX-FileCopyrightText: George Nachman and the iTerm2 authors
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Ported from iTerm2's ProgramStatusTests.
+ 
+ // Ports the record-model tests of iTerm2 (ProgramStatusTests) and checks how
+ // OSC 7501 records share a session's status with the hooks.
+diff --git a/src/plugins/ClaudeCode/autotests/SessionStatusTest.cpp b/src/plugins/ClaudeCode/autotests/SessionStatusTest.cpp
+index 7ba25b7..df2ad57 100644
+--- a/src/plugins/ClaudeCode/autotests/SessionStatusTest.cpp
++++ b/src/plugins/ClaudeCode/autotests/SessionStatusTest.cpp
+@@ -1,5 +1,8 @@
+ // SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
+-// SPDX-License-Identifier: GPL-2.0-or-later
++// SPDX-FileCopyrightText: George Nachman and the iTerm2 authors
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Ported from iTerm2's SetStatusBuiltInFunctionTests, SessionTabStatusBackgroundTasksTests and TabStatusControllerTests.
+ 
+ // Ports the status-model tests of iTerm2 (SetStatusBuiltInFunctionTests,
+ // SessionTabStatusBackgroundTasksTests, TabStatusControllerTests), so the
+diff --git a/src/plugins/ClaudeCode/programstatusrecords.cpp b/src/plugins/ClaudeCode/programstatusrecords.cpp
+index cd91914..736898e 100644
+--- a/src/plugins/ClaudeCode/programstatusrecords.cpp
++++ b/src/plugins/ClaudeCode/programstatusrecords.cpp
+@@ -1,5 +1,8 @@
+ // SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
+-// SPDX-License-Identifier: GPL-2.0-or-later
++// SPDX-FileCopyrightText: George Nachman and the iTerm2 authors
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Ported from iTerm2's iTermProgramStatus.swift.
+ 
+ #include "programstatusrecords.h"
+ #include "sessionstatus.h"
+diff --git a/src/plugins/ClaudeCode/programstatusrecords.h b/src/plugins/ClaudeCode/programstatusrecords.h
+index 71db74b..1b625bc 100644
+--- a/src/plugins/ClaudeCode/programstatusrecords.h
++++ b/src/plugins/ClaudeCode/programstatusrecords.h
+@@ -1,5 +1,8 @@
+ // SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
+-// SPDX-License-Identifier: GPL-2.0-or-later
++// SPDX-FileCopyrightText: George Nachman and the iTerm2 authors
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Ported from iTerm2's iTermProgramStatus.swift.
+ 
+ #ifndef PROGRAMSTATUSRECORDS_H
+ #define PROGRAMSTATUSRECORDS_H
+diff --git a/src/plugins/ClaudeCode/sessionstatus.cpp b/src/plugins/ClaudeCode/sessionstatus.cpp
+index 53f33c9..cc89280 100644
+--- a/src/plugins/ClaudeCode/sessionstatus.cpp
++++ b/src/plugins/ClaudeCode/sessionstatus.cpp
+@@ -1,5 +1,8 @@
+ // SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
+-// SPDX-License-Identifier: GPL-2.0-or-later
++// SPDX-FileCopyrightText: George Nachman and the iTerm2 authors
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Ported from iTerm2's iTermSessionTabStatus.swift, iTermTabStatusController.swift and SetStatusBuiltInFunction.swift.
+ 
+ #include "sessionstatus.h"
+ 
+diff --git a/src/plugins/ClaudeCode/sessionstatus.h b/src/plugins/ClaudeCode/sessionstatus.h
+index 88f7b40..f30f299 100644
+--- a/src/plugins/ClaudeCode/sessionstatus.h
++++ b/src/plugins/ClaudeCode/sessionstatus.h
+@@ -1,5 +1,8 @@
+ // SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
+-// SPDX-License-Identifier: GPL-2.0-or-later
++// SPDX-FileCopyrightText: George Nachman and the iTerm2 authors
++// SPDX-License-Identifier: GPL-2.0-only
++//
++// Ported from iTerm2's iTermSessionTabStatus.swift, iTermTabStatusController.swift and SetStatusBuiltInFunction.swift.
+ 
+ #ifndef SESSIONSTATUS_H
+ #define SESSIONSTATUS_H
+diff --git a/src/plugins/ClaudeCode/workgroup/claudecode-diff b/src/plugins/ClaudeCode/workgroup/claudecode-diff
+index 26820a5..19a512c 100755
+--- a/src/plugins/ClaudeCode/workgroup/claudecode-diff
++++ b/src/plugins/ClaudeCode/workgroup/claudecode-diff
+@@ -1,6 +1,9 @@
+ #!/bin/bash
+ # SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
+-# SPDX-License-Identifier: GPL-2.0-or-later
++# SPDX-FileCopyrightText: George Nachman and the iTerm2 authors
++# SPDX-License-Identifier: GPL-2.0-only
++#
++# The waiting message is iTerm2's DiffWaitingPromptView text.
+ #
+ # The Diff member of a Claude Code workgroup in Konsole.
+ #
+-- 
+2.56.0
+

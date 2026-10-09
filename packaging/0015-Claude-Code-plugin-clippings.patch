@@ -1,0 +1,1251 @@
+From e524c21d0ef6733b4de9d886890e73bed8e19589 Mon Sep 17 00:00:00 2001
+From: Eric Duprey <509630+destinal@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 14:50:37 -0700
+Subject: [PATCH 15/17] Claude Code plugin: clippings
+
+A code review in a workgroup files its findings as clippings, as in
+iTerm2, kept by the workgroup's Chat session:
+
+- it2 gains `session add-clipping TYPE TITLE DETAIL` and
+  `session archive-clippings`, and accepts a session named by all of
+  $TERM_SESSION_ID as well as by what follows its first colon. The D-Bus
+  object gains addClipping, archiveClippings and clippings.
+- The review runs with iTerm2's code review system prompt, which tells
+  it to archive the last round and file each finding with it2, and with
+  settings that let it run those two commands without asking.
+- The Claude Clippings panel (Ctrl+Shift+F4) shows the findings of the
+  workgroup in view and opens when new ones arrive. Send to Chat pastes
+  the selected findings, or all, into Chat as a bracketed paste without
+  submitting, archives them and switches to Chat; Archive archives.
+- Send Review Findings to Chat Automatically (off by default,
+  [ClaudeCode] AutoSendClippings): when the review goes from working to
+  finished and Chat is not working, its findings are pasted into Chat,
+  submitted half a second later, archived, and Chat is shown.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/plugins/ClaudeCode/CMakeLists.txt         |   7 +-
+ .../ClaudeCode/autotests/CMakeLists.txt       |   9 +
+ .../autotests/ClippingStoreTest.cpp           |  98 ++++++++
+ src/plugins/ClaudeCode/claudecodedbus.cpp     |  34 ++-
+ src/plugins/ClaudeCode/claudecodedbus.h       |  13 +-
+ src/plugins/ClaudeCode/claudecodeplugin.cpp   |  65 +++++-
+ src/plugins/ClaudeCode/clippingstore.cpp      |  93 ++++++++
+ src/plugins/ClaudeCode/clippingstore.h        |  68 ++++++
+ src/plugins/ClaudeCode/clippingswidget.cpp    | 209 ++++++++++++++++++
+ src/plugins/ClaudeCode/clippingswidget.h      |  60 +++++
+ src/plugins/ClaudeCode/it2/it2.cpp            |  44 +++-
+ src/plugins/ClaudeCode/sessionnavigation.cpp  |  28 +++
+ src/plugins/ClaudeCode/sessionnavigation.h    |   8 +
+ .../workgroup/code-review-settings.json       |   1 +
+ .../workgroup/code-review-system-prompt.txt   |  36 +++
+ src/plugins/ClaudeCode/workgroupmanager.cpp   |  57 ++++-
+ src/plugins/ClaudeCode/workgroupmanager.h     |  15 +-
+ 17 files changed, 829 insertions(+), 16 deletions(-)
+ create mode 100644 src/plugins/ClaudeCode/autotests/ClippingStoreTest.cpp
+ create mode 100644 src/plugins/ClaudeCode/clippingstore.cpp
+ create mode 100644 src/plugins/ClaudeCode/clippingstore.h
+ create mode 100644 src/plugins/ClaudeCode/clippingswidget.cpp
+ create mode 100644 src/plugins/ClaudeCode/clippingswidget.h
+ create mode 100644 src/plugins/ClaudeCode/workgroup/code-review-settings.json
+ create mode 100644 src/plugins/ClaudeCode/workgroup/code-review-system-prompt.txt
+
+diff --git a/src/plugins/ClaudeCode/CMakeLists.txt b/src/plugins/ClaudeCode/CMakeLists.txt
+index 8b10e7a..17390d0 100644
+--- a/src/plugins/ClaudeCode/CMakeLists.txt
++++ b/src/plugins/ClaudeCode/CMakeLists.txt
+@@ -4,6 +4,8 @@ SOURCES
+     claudecodedbus.cpp
+     claudesessionsmodel.cpp
+     claudesessionswidget.cpp
++    clippingstore.cpp
++    clippingswidget.cpp
+     sessionnavigation.cpp
+     statusnotifier.cpp
+     workgroup.cpp
+@@ -34,11 +36,12 @@ target_compile_definitions(konsole_claudecodeplugin PRIVATE
+ 
+ # The workgroup's member scripts, beside it2 and the hook. review-prompt.txt
+ # is iTerm2's default code review prompt.
+-foreach(file claudecode-diff claudecode-review review-prompt.txt)
++foreach(file claudecode-diff claudecode-review review-prompt.txt code-review-system-prompt.txt code-review-settings.json)
+     configure_file(workgroup/${file} ${CMAKE_BINARY_DIR}/bin/claudecode/${file} COPYONLY)
+ endforeach()
+ install(PROGRAMS workgroup/claudecode-diff workgroup/claudecode-review DESTINATION ${KDE_INSTALL_LIBEXECDIR}/konsole-claudecode)
+-install(FILES workgroup/review-prompt.txt DESTINATION ${KDE_INSTALL_LIBEXECDIR}/konsole-claudecode)
++install(FILES workgroup/review-prompt.txt workgroup/code-review-system-prompt.txt workgroup/code-review-settings.json
++        DESTINATION ${KDE_INSTALL_LIBEXECDIR}/konsole-claudecode)
+ 
+ add_subdirectory(it2)
+ 
+diff --git a/src/plugins/ClaudeCode/autotests/CMakeLists.txt b/src/plugins/ClaudeCode/autotests/CMakeLists.txt
+index c5975ef..a485362 100644
+--- a/src/plugins/ClaudeCode/autotests/CMakeLists.txt
++++ b/src/plugins/ClaudeCode/autotests/CMakeLists.txt
+@@ -19,3 +19,12 @@ ecm_add_test(
+     LINK_LIBRARIES Qt::Test KF6::I18n konsoleprivate
+ )
+ target_include_directories(ClaudeCodeProgramStatusRecordsTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
++
++ecm_add_test(
++    ClippingStoreTest.cpp
++    ../clippingstore.cpp
++    ../clippingstore.h
++    TEST_NAME ClaudeCodeClippingStoreTest
++    LINK_LIBRARIES Qt::Test konsoleprivate
++)
++target_include_directories(ClaudeCodeClippingStoreTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+diff --git a/src/plugins/ClaudeCode/autotests/ClippingStoreTest.cpp b/src/plugins/ClaudeCode/autotests/ClippingStoreTest.cpp
+new file mode 100644
+index 0000000..00a085e
+--- /dev/null
++++ b/src/plugins/ClaudeCode/autotests/ClippingStoreTest.cpp
+@@ -0,0 +1,98 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "clippingstore.h"
++
++#include "session/Session.h"
++
++#include <QSignalSpy>
++#include <QTest>
++
++namespace
++{
++Clipping clipping(const char *title, const char *detail)
++{
++    return Clipping{QStringLiteral("Code Review Comment"), QString::fromUtf8(title), QString::fromUtf8(detail), QDateTime()};
++}
++
++QStringList titles(const QList<Clipping> &clippings)
++{
++    QStringList result;
++    for (const Clipping &c : clippings) {
++        result.append(c.title);
++    }
++    return result;
++}
++}
++
++class ClippingStoreTest : public QObject
++{
++    Q_OBJECT
++
++private Q_SLOTS:
++    void testFormatted();
++    void testAddAndArchive();
++    void testArchiveSome();
++    void testSessionsAreSeparateAndForgotten();
++};
++
++void ClippingStoreTest::testFormatted()
++{
++    QCOMPARE(clipping("Leak", "In f()").formatted(), QStringLiteral("**Leak**\nIn f()"));
++    // No title: just the detail.
++    QCOMPARE(clipping(" ", "In f()").formatted(), QStringLiteral("In f()"));
++    QCOMPARE(ClippingStore::formatted({clipping("A", "a"), clipping("B", "b")}), QStringLiteral("**A**\na\n--\n**B**\nb"));
++}
++
++void ClippingStoreTest::testAddAndArchive()
++{
++    Konsole::Session session;
++    ClippingStore store;
++    QSignalSpy changed(&store, &ClippingStore::changed);
++    QSignalSpy added(&store, &ClippingStore::added);
++
++    store.add(&session, clipping("A", "a"));
++    store.add(&session, clipping("B", "b"));
++    QCOMPARE(titles(store.live(&session)), (QStringList{QStringLiteral("A"), QStringLiteral("B")}));
++    QCOMPARE(added.count(), 2);
++
++    store.archive(&session);
++    QVERIFY(store.live(&session).isEmpty());
++    QCOMPARE(titles(store.archived(&session)), (QStringList{QStringLiteral("A"), QStringLiteral("B")}));
++    QCOMPARE(changed.count(), 3);
++
++    // Nothing live: no change.
++    store.archive(&session);
++    QCOMPARE(changed.count(), 3);
++}
++
++void ClippingStoreTest::testArchiveSome()
++{
++    Konsole::Session session;
++    ClippingStore store;
++    for (const char *title : {"A", "B", "C", "D"}) {
++        store.add(&session, clipping(title, ""));
++    }
++    // Unordered, repeated and out-of-range indexes are fine.
++    store.archive(&session, {2, 0, 2, 9});
++    QCOMPARE(titles(store.live(&session)), (QStringList{QStringLiteral("B"), QStringLiteral("D")}));
++    QCOMPARE(store.archived(&session).size(), 2);
++}
++
++void ClippingStoreTest::testSessionsAreSeparateAndForgotten()
++{
++    ClippingStore store;
++    auto *first = new Konsole::Session();
++    Konsole::Session second;
++    store.add(first, clipping("A", ""));
++    store.add(&second, clipping("B", ""));
++    QCOMPARE(titles(store.live(&second)), QStringList{QStringLiteral("B")});
++
++    delete first;
++    QVERIFY(store.live(first).isEmpty());
++    QCOMPARE(store.live(&second).size(), 1);
++}
++
++QTEST_MAIN(ClippingStoreTest)
++
++#include "ClippingStoreTest.moc"
+diff --git a/src/plugins/ClaudeCode/claudecodedbus.cpp b/src/plugins/ClaudeCode/claudecodedbus.cpp
+index 160860c..4a5fdb1 100644
+--- a/src/plugins/ClaudeCode/claudecodedbus.cpp
++++ b/src/plugins/ClaudeCode/claudecodedbus.cpp
+@@ -2,17 +2,21 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "claudecodedbus.h"
++#include "clippingstore.h"
+ #include "sessionstatus.h"
+ #include "sessionstatusregistry.h"
+ 
+ #include "session/Session.h"
+ 
+ #include <QDBusConnection>
++#include <QJsonArray>
+ #include <QJsonDocument>
++#include <QJsonObject>
+ 
+-ClaudeCodeDBus::ClaudeCodeDBus(SessionStatusRegistry *registry, QObject *parent)
++ClaudeCodeDBus::ClaudeCodeDBus(SessionStatusRegistry *registry, ClippingStore *clippings, QObject *parent)
+     : QObject(parent)
+     , _registry(registry)
++    , _clippings(clippings)
+ {
+ }
+ 
+@@ -68,6 +72,34 @@ qlonglong ClaudeCodeDBus::getBackgroundTaskCount(const QString &session)
+     return status != nullptr ? status->backgroundTasks() : 0;
+ }
+ 
++void ClaudeCodeDBus::addClipping(const QString &session, const QString &type, const QString &title, const QString &detail)
++{
++    if (statusOrError(session) != nullptr) {
++        _clippings->add(_registry->session(session), Clipping{type, title, detail, QDateTime::currentDateTime()});
++    }
++}
++
++void ClaudeCodeDBus::archiveClippings(const QString &session)
++{
++    if (statusOrError(session) != nullptr) {
++        _clippings->archive(_registry->session(session));
++    }
++}
++
++QString ClaudeCodeDBus::clippings(const QString &session)
++{
++    if (statusOrError(session) == nullptr) {
++        return {};
++    }
++    QJsonArray array;
++    const auto live = _clippings->live(_registry->session(session));
++    for (const Clipping &clipping : live) {
++        array.append(
++            QJsonObject{{QStringLiteral("type"), clipping.type}, {QStringLiteral("title"), clipping.title}, {QStringLiteral("detail"), clipping.detail}});
++    }
++    return QString::fromUtf8(QJsonDocument(array).toJson(QJsonDocument::Compact));
++}
++
+ SessionStatus *ClaudeCodeDBus::statusOrError(const QString &session)
+ {
+     SessionStatus *status = _registry->status(_registry->session(session));
+diff --git a/src/plugins/ClaudeCode/claudecodedbus.h b/src/plugins/ClaudeCode/claudecodedbus.h
+index a3fd321..ab65bac 100644
+--- a/src/plugins/ClaudeCode/claudecodedbus.h
++++ b/src/plugins/ClaudeCode/claudecodedbus.h
+@@ -9,6 +9,7 @@
+ #include <QStringList>
+ #include <QVariantMap>
+ 
++class ClippingStore;
+ class SessionStatus;
+ class SessionStatusRegistry;
+ 
+@@ -27,7 +28,7 @@ class ClaudeCodeDBus : public QObject, protected QDBusContext
+     Q_CLASSINFO("D-Bus Interface", "org.kde.konsole.ClaudeCode")
+ 
+ public:
+-    ClaudeCodeDBus(SessionStatusRegistry *registry, QObject *parent);
++    ClaudeCodeDBus(SessionStatusRegistry *registry, ClippingStore *clippings, QObject *parent);
+ 
+     /** Registers the object on the session bus. Returns whether it succeeded. */
+     bool registerObject();
+@@ -53,10 +54,20 @@ public Q_SLOTS:
+     /** Returns the background-task count cc-status last parked for the session. */
+     qlonglong getBackgroundTaskCount(const QString &session);
+ 
++    /** Files a code review finding with @p session, as `it2 session add-clipping` does. */
++    void addClipping(const QString &session, const QString &type, const QString &title, const QString &detail);
++
++    /** Moves @p session's live clippings to its archive, as `it2 session archive-clippings` does. */
++    void archiveClippings(const QString &session);
++
++    /** Returns @p session's live clippings as a JSON array of {type, title, detail}. */
++    QString clippings(const QString &session);
++
+ private:
+     SessionStatus *statusOrError(const QString &session);
+ 
+     SessionStatusRegistry *_registry;
++    ClippingStore *_clippings;
+ };
+ 
+ #endif // CLAUDECODEDBUS_H
+diff --git a/src/plugins/ClaudeCode/claudecodeplugin.cpp b/src/plugins/ClaudeCode/claudecodeplugin.cpp
+index 4f3b8fb..550eb70 100644
+--- a/src/plugins/ClaudeCode/claudecodeplugin.cpp
++++ b/src/plugins/ClaudeCode/claudecodeplugin.cpp
+@@ -5,8 +5,11 @@
+ #include "claudecodedbus.h"
+ #include "claudesessionsmodel.h"
+ #include "claudesessionswidget.h"
++#include "clippingstore.h"
++#include "clippingswidget.h"
+ #include "konsoledebug.h"
+ #include "programstatusrecords.h"
++#include "sessionnavigation.h"
+ #include "sessionstatus.h"
+ #include "sessionstatusregistry.h"
+ #include "statusbadges.h"
+@@ -32,7 +35,10 @@ struct ClaudeCodePlugin::Private {
+     ClaudeSessionsModel *model = nullptr;
+     StatusBadges *badges = nullptr;
+     WorkgroupManager *workgroups = nullptr;
++    ClippingStore *clippings = nullptr;
+     QMap<Konsole::MainWindow *, QDockWidget *> dockForWindow;
++    QMap<Konsole::MainWindow *, QDockWidget *> clippingsDockForWindow;
++    QMap<Konsole::MainWindow *, ClippingsWidget *> clippingsForWindow;
+ };
+ 
+ ClaudeCodePlugin::ClaudeCodePlugin(QObject *object, const QVariantList &args)
+@@ -45,14 +51,24 @@ ClaudeCodePlugin::ClaudeCodePlugin(QObject *object, const QVariantList &args)
+     priv->model = new ClaudeSessionsModel(priv->registry, this);
+     new StatusNotifier(priv->registry, this);
+     priv->badges = new StatusBadges(priv->registry, this);
+-    priv->workgroups = new WorkgroupManager(priv->registry, this);
++    priv->clippings = new ClippingStore(this);
++    priv->workgroups = new WorkgroupManager(priv->registry, priv->clippings, this);
++
++    // New findings bring up the Clippings panel of each window showing them.
++    connect(priv->clippings, &ClippingStore::added, this, [this](Konsole::Session *owner) {
++        for (auto it = priv->clippingsForWindow.cbegin(); it != priv->clippingsForWindow.cend(); ++it) {
++            if (it.value()->owner() == owner) {
++                priv->clippingsDockForWindow.value(it.key())->show();
++            }
++        }
++    });
+ 
+     // The session's tab shows its status as a colored dot.
+     connect(priv->registry, &SessionStatusRegistry::statusChanged, this, [this](Konsole::Session *session) {
+         SessionStatus *status = priv->registry->status(session);
+         session->setStatusIndicator(status != nullptr && status->hasActiveStatus() ? status->indicator() : QColor());
+     });
+-    auto *dbus = new ClaudeCodeDBus(priv->registry, this);
++    auto *dbus = new ClaudeCodeDBus(priv->registry, priv->clippings, this);
+     if (!dbus->registerObject()) {
+         qCWarning(KonsoleDebug) << "Claude Code plugin could not register /ClaudeCode on D-Bus";
+     }
+@@ -83,17 +99,45 @@ void ClaudeCodePlugin::createWidgetsForMainWindow(Konsole::MainWindow *mainWindo
+         }
+     });
+     priv->dockForWindow[mainWindow] = dock;
++
++    auto *clippingsDock = new QDockWidget(mainWindow);
++    clippingsDock->setWindowTitle(i18n("Claude Clippings"));
++    auto *clippingsWidget = new ClippingsWidget(priv->clippings, clippingsDock);
++    clippingsDock->setWidget(clippingsWidget);
++    clippingsDock->setObjectName(QStringLiteral("ClaudeCodeClippingsDock"));
++    clippingsDock->setAllowedAreas(Qt::DockWidgetArea::LeftDockWidgetArea | Qt::DockWidgetArea::RightDockWidgetArea);
++    mainWindow->addDockWidget(Qt::RightDockWidgetArea, clippingsDock);
++    clippingsDock->hide();
++    priv->clippingsDockForWindow[mainWindow] = clippingsDock;
++    priv->clippingsForWindow[mainWindow] = clippingsWidget;
++    // Inside a workgroup, Chat is shown by switching to it.
++    connect(clippingsWidget, &ClippingsWidget::sentToChat, this, [this](Konsole::Session *owner) {
++        if (Workgroup *workgroup = priv->workgroups->workgroup(owner)) {
++            workgroup->show(Workgroup::Chat);
++        } else {
++            ClaudeCode::activateSession(owner);
++        }
++    });
++
+     connect(mainWindow, &QObject::destroyed, this, [this, mainWindow] {
+         priv->dockForWindow.remove(mainWindow);
++        priv->clippingsDockForWindow.remove(mainWindow);
++        priv->clippingsForWindow.remove(mainWindow);
+     });
+ }
+ 
+ void ClaudeCodePlugin::activeViewChanged(Konsole::SessionController *controller, Konsole::MainWindow *mainWindow)
+ {
+-    Q_UNUSED(mainWindow)
+     if (controller == nullptr || controller->view() == nullptr) {
+         return;
+     }
++    // The Clippings panel shows the findings of the workgroup in view, kept
++    // by its Chat session, or else those of the session itself.
++    if (ClippingsWidget *clippings = priv->clippingsForWindow.value(mainWindow)) {
++        Konsole::Session *session = controller->session();
++        Workgroup *workgroup = priv->workgroups->workgroup(session);
++        clippings->setOwner(workgroup != nullptr ? workgroup->session(Workgroup::Chat) : session);
++    }
+     // A key press in a session showing a finished or failed turn means the
+     // user has seen it. Only the active view takes keys, so connecting here
+     // covers every view that ever does.
+@@ -157,6 +201,18 @@ QList<QAction *> ClaudeCodePlugin::menuBarActions(Konsole::MainWindow *mainWindo
+         memberActions.append(action);
+     }
+ 
++    QAction *clippingsAction = priv->clippingsDockForWindow[mainWindow]->toggleViewAction();
++    clippingsAction->setText(i18n("Show Claude Clippings"));
++    mainWindow->actionCollection()->addAction(QStringLiteral("claudecode-show-clippings"), clippingsAction);
++    mainWindow->actionCollection()->setDefaultShortcut(clippingsAction, QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_F4));
++
++    auto *autoSendAction = new QAction(i18n("Send Review Findings to Chat Automatically"), mainWindow);
++    autoSendAction->setCheckable(true);
++    autoSendAction->setChecked(priv->workgroups->autoSend());
++    mainWindow->actionCollection()->addAction(QStringLiteral("claudecode-auto-send-clippings"), autoSendAction);
++    connect(autoSendAction, &QAction::toggled, priv->workgroups, &WorkgroupManager::setAutoSend);
++    connect(priv->workgroups, &WorkgroupManager::autoSendChanged, autoSendAction, &QAction::setChecked);
++
+     auto *autoEnterAction = new QAction(i18n("Enter Claude Workgroups Automatically"), mainWindow);
+     autoEnterAction->setCheckable(true);
+     autoEnterAction->setChecked(priv->workgroups->autoEnter());
+@@ -164,7 +220,8 @@ QList<QAction *> ClaudeCodePlugin::menuBarActions(Konsole::MainWindow *mainWindo
+     connect(autoEnterAction, &QAction::toggled, priv->workgroups, &WorkgroupManager::setAutoEnter);
+     connect(priv->workgroups, &WorkgroupManager::autoEnterChanged, autoEnterAction, &QAction::setChecked);
+ 
+-    return QList<QAction *>{toggleVisibilityAction, badgesAction, enterAction, exitAction} + memberActions + QList<QAction *>{autoEnterAction};
++    return QList<QAction *>{toggleVisibilityAction, clippingsAction, badgesAction, enterAction, exitAction} + memberActions
++        + QList<QAction *>{autoEnterAction, autoSendAction};
+ }
+ 
+ #include "claudecodeplugin.moc"
+diff --git a/src/plugins/ClaudeCode/clippingstore.cpp b/src/plugins/ClaudeCode/clippingstore.cpp
+new file mode 100644
+index 0000000..026f29c
+--- /dev/null
++++ b/src/plugins/ClaudeCode/clippingstore.cpp
+@@ -0,0 +1,93 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "clippingstore.h"
++
++#include "session/Session.h"
++
++#include <algorithm>
++
++QString Clipping::formatted() const
++{
++    if (title.trimmed().isEmpty()) {
++        return detail;
++    }
++    return QStringLiteral("**%1**\n%2").arg(title, detail);
++}
++
++ClippingStore::ClippingStore(QObject *parent)
++    : QObject(parent)
++{
++}
++
++QList<Clipping> ClippingStore::live(Konsole::Session *session) const
++{
++    return _clippings.value(session).live;
++}
++
++QList<Clipping> ClippingStore::archived(Konsole::Session *session) const
++{
++    return _clippings.value(session).archived;
++}
++
++void ClippingStore::watch(Konsole::Session *session)
++{
++    // Once per session: a lambda cannot be a unique connection.
++    if (_clippings.contains(session)) {
++        return;
++    }
++    connect(session, &QObject::destroyed, this, [this, session] {
++        _clippings.remove(session);
++    });
++}
++
++void ClippingStore::add(Konsole::Session *session, const Clipping &clipping)
++{
++    watch(session);
++    _clippings[session].live.append(clipping);
++    Q_EMIT changed(session);
++    Q_EMIT added(session);
++}
++
++void ClippingStore::archive(Konsole::Session *session)
++{
++    auto it = _clippings.find(session);
++    if (it == _clippings.end() || it->live.isEmpty()) {
++        return;
++    }
++    it->archived.append(it->live);
++    it->live.clear();
++    Q_EMIT changed(session);
++}
++
++void ClippingStore::archive(Konsole::Session *session, QList<int> indexes)
++{
++    auto it = _clippings.find(session);
++    if (it == _clippings.end()) {
++        return;
++    }
++    // From the back, so earlier indexes stay valid.
++    std::sort(indexes.begin(), indexes.end(), std::greater<int>());
++    indexes.erase(std::unique(indexes.begin(), indexes.end()), indexes.end());
++    bool archived = false;
++    for (int index : std::as_const(indexes)) {
++        if (index >= 0 && index < it->live.size()) {
++            it->archived.append(it->live.takeAt(index));
++            archived = true;
++        }
++    }
++    if (archived) {
++        Q_EMIT changed(session);
++    }
++}
++
++QString ClippingStore::formatted(const QList<Clipping> &clippings)
++{
++    QStringList parts;
++    for (const Clipping &clipping : clippings) {
++        parts.append(clipping.formatted());
++    }
++    return parts.join(QLatin1String("\n--\n"));
++}
++
++#include "moc_clippingstore.cpp"
+diff --git a/src/plugins/ClaudeCode/clippingstore.h b/src/plugins/ClaudeCode/clippingstore.h
+new file mode 100644
+index 0000000..7402c19
+--- /dev/null
++++ b/src/plugins/ClaudeCode/clippingstore.h
+@@ -0,0 +1,68 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#ifndef CLIPPINGSTORE_H
++#define CLIPPINGSTORE_H
++
++#include <QDateTime>
++#include <QHash>
++#include <QList>
++#include <QObject>
++#include <QString>
++
++namespace Konsole
++{
++class Session;
++}
++
++/** One finding a code review filed with `it2 session add-clipping`. */
++struct Clipping {
++    QString type;
++    QString title;
++    QString detail;
++    QDateTime added;
++
++    /** The clipping as it is sent to Chat: the title in bold, then the detail. */
++    QString formatted() const;
++};
++
++/**
++ * The clippings filed with each session: live ones, waiting to be acted on,
++ * and archived ones, kept as history. A workgroup's clippings belong to its
++ * Chat session. Kept in memory only.
++ */
++class ClippingStore : public QObject
++{
++    Q_OBJECT
++
++public:
++    explicit ClippingStore(QObject *parent = nullptr);
++
++    QList<Clipping> live(Konsole::Session *session) const;
++    QList<Clipping> archived(Konsole::Session *session) const;
++
++    void add(Konsole::Session *session, const Clipping &clipping);
++    /** Moves every live clipping to the archive. */
++    void archive(Konsole::Session *session);
++    /** Moves the live clippings at @p indexes to the archive. */
++    void archive(Konsole::Session *session, QList<int> indexes);
++
++    /** @p clippings formatted for Chat, separated by "--" lines. */
++    static QString formatted(const QList<Clipping> &clippings);
++
++Q_SIGNALS:
++    void changed(Konsole::Session *session);
++    /** A clipping was added to @p session. */
++    void added(Konsole::Session *session);
++
++private:
++    struct Clippings {
++        QList<Clipping> live;
++        QList<Clipping> archived;
++    };
++    void watch(Konsole::Session *session);
++
++    QHash<Konsole::Session *, Clippings> _clippings;
++};
++
++#endif // CLIPPINGSTORE_H
+diff --git a/src/plugins/ClaudeCode/clippingswidget.cpp b/src/plugins/ClaudeCode/clippingswidget.cpp
+new file mode 100644
+index 0000000..ca048e8
+--- /dev/null
++++ b/src/plugins/ClaudeCode/clippingswidget.cpp
+@@ -0,0 +1,209 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "clippingswidget.h"
++#include "clippingstore.h"
++#include "session/Session.h"
++#include "sessionnavigation.h"
++
++#include <KLocalizedString>
++
++#include <QApplication>
++#include <QHBoxLayout>
++#include <QLabel>
++#include <QListWidget>
++#include <QPainter>
++#include <QPushButton>
++#include <QStackedLayout>
++#include <QStyledItemDelegate>
++#include <QVBoxLayout>
++
++namespace
++{
++constexpr int padding = 6;
++constexpr int detailLines = 3;
++constexpr int detailRole = Qt::UserRole + 1;
++
++// A finding: its title in bold, then the start of its detail.
++class ClippingDelegate : public QStyledItemDelegate
++{
++public:
++    using QStyledItemDelegate::QStyledItemDelegate;
++
++    QSize sizeHint(const QStyleOptionViewItem &option, const QModelIndex &index) const override
++    {
++        Q_UNUSED(index)
++        return QSize(option.rect.width(), 2 * padding + (1 + detailLines) * QFontMetrics(option.font).lineSpacing());
++    }
++
++    void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override
++    {
++        QStyleOptionViewItem opt = option;
++        initStyleOption(&opt, index);
++        opt.text.clear();
++        QStyle *style = opt.widget != nullptr ? opt.widget->style() : QApplication::style();
++        style->drawControl(QStyle::CE_ItemViewItem, &opt, painter, opt.widget);
++
++        painter->save();
++        const QRect area = option.rect.adjusted(padding, padding, -padding, -padding);
++        const QFontMetrics metrics(option.font);
++        const int lineHeight = metrics.lineSpacing();
++        const bool selected = option.state & QStyle::State_Selected;
++
++        QFont bold = option.font;
++        bold.setBold(true);
++        painter->setFont(bold);
++        painter->setPen(option.palette.color(selected ? QPalette::HighlightedText : QPalette::Text));
++        painter->drawText(QRect(area.left(), area.top(), area.width(), lineHeight),
++                          Qt::AlignLeft | Qt::AlignVCenter,
++                          QFontMetrics(bold).elidedText(index.data().toString(), Qt::ElideRight, area.width()));
++
++        painter->setFont(option.font);
++        painter->setPen(option.palette.color(selected ? QPalette::HighlightedText : QPalette::PlaceholderText));
++        // Wrap the detail into a few lines and elide the last one.
++        const QString detail = index.data(detailRole).toString().simplified();
++        QString remaining = detail;
++        for (int line = 0; line < detailLines && !remaining.isEmpty(); line++) {
++            const QRect lineRect(area.left(), area.top() + (line + 1) * lineHeight, area.width(), lineHeight);
++            QString text = remaining;
++            if (line == detailLines - 1 || metrics.horizontalAdvance(remaining) <= area.width()) {
++                text = metrics.elidedText(remaining, Qt::ElideRight, area.width());
++                remaining.clear();
++            } else {
++                // The longest run of whole words that fits.
++                int cut = remaining.size();
++                while (cut > 0 && metrics.horizontalAdvance(remaining.left(cut)) > area.width()) {
++                    const int space = remaining.lastIndexOf(QLatin1Char(' '), cut - 1);
++                    cut = space > 0 ? space : cut - 1;
++                }
++                text = remaining.left(cut);
++                remaining = remaining.mid(cut).trimmed();
++            }
++            painter->drawText(lineRect, Qt::AlignLeft | Qt::AlignVCenter, text);
++        }
++        painter->restore();
++    }
++};
++}
++
++ClippingsWidget::ClippingsWidget(ClippingStore *store, QWidget *parent)
++    : QWidget(parent)
++    , _store(store)
++    , _heading(new QLabel(this))
++    , _list(new QListWidget(this))
++    , _send(new QPushButton(QIcon::fromTheme(QStringLiteral("document-send")), i18n("Send to Chat"), this))
++    , _archive(new QPushButton(QIcon::fromTheme(QStringLiteral("archive-insert")), i18n("Archive"), this))
++    , _stack(new QStackedLayout())
++{
++    _heading->setWordWrap(true);
++    _list->setItemDelegate(new ClippingDelegate(_list));
++    _list->setSelectionMode(QAbstractItemView::ExtendedSelection);
++    _list->setFrameShape(QFrame::NoFrame);
++    _send->setToolTip(i18n("Paste the selected findings, or all of them, into the Chat session, and archive them"));
++    _archive->setToolTip(i18n("Archive the selected findings, or all of them"));
++
++    auto *placeholder = new QLabel(i18n("No findings. A code review in a Claude workgroup files them here."), this);
++    placeholder->setAlignment(Qt::AlignCenter);
++    placeholder->setWordWrap(true);
++    placeholder->setEnabled(false);
++    _stack->addWidget(placeholder);
++    _stack->addWidget(_list);
++
++    auto *buttons = new QHBoxLayout();
++    buttons->addWidget(_send);
++    buttons->addWidget(_archive);
++
++    auto *layout = new QVBoxLayout(this);
++    layout->addWidget(_heading);
++    layout->addLayout(_stack, 1);
++    layout->addLayout(buttons);
++
++    connect(_store, &ClippingStore::changed, this, [this](Konsole::Session *session) {
++        if (session == _owner) {
++            refresh();
++        }
++    });
++    connect(_send, &QPushButton::clicked, this, [this] {
++        sendToChat(chosenRows());
++    });
++    connect(_archive, &QPushButton::clicked, this, [this] {
++        if (_owner != nullptr) {
++            _store->archive(_owner, chosenRows());
++        }
++    });
++    connect(_list, &QListWidget::itemActivated, this, [this](QListWidgetItem *item) {
++        sendToChat({_list->row(item)});
++    });
++    refresh();
++}
++
++void ClippingsWidget::setOwner(Konsole::Session *owner)
++{
++    if (_owner == owner) {
++        return;
++    }
++    _owner = owner;
++    refresh();
++}
++
++Konsole::Session *ClippingsWidget::owner() const
++{
++    return _owner;
++}
++
++QSize ClippingsWidget::sizeHint() const
++{
++    return QSize(fontMetrics().averageCharWidth() * 36, QWidget::sizeHint().height());
++}
++
++QList<int> ClippingsWidget::chosenRows() const
++{
++    QList<int> rows;
++    const auto selected = _list->selectedItems();
++    for (QListWidgetItem *item : selected) {
++        rows.append(_list->row(item));
++    }
++    if (rows.isEmpty()) {
++        for (int row = 0; row < _list->count(); row++) {
++            rows.append(row);
++        }
++    }
++    std::sort(rows.begin(), rows.end());
++    return rows;
++}
++
++void ClippingsWidget::sendToChat(const QList<int> &rows)
++{
++    if (_owner == nullptr || rows.isEmpty()) {
++        return;
++    }
++    const QList<Clipping> live = _store->live(_owner);
++    QList<Clipping> chosen;
++    for (int row : rows) {
++        if (row >= 0 && row < live.size()) {
++            chosen.append(live.at(row));
++        }
++    }
++    // Pasted, not submitted: the user reads it over and presses Enter.
++    ClaudeCode::pasteIntoSession(_owner, ClippingStore::formatted(chosen), false);
++    _store->archive(_owner, rows);
++    Q_EMIT sentToChat(_owner);
++}
++
++void ClippingsWidget::refresh()
++{
++    _list->clear();
++    const QList<Clipping> live = _owner != nullptr ? _store->live(_owner) : QList<Clipping>();
++    for (const Clipping &clipping : live) {
++        auto *item = new QListWidgetItem(clipping.title.isEmpty() ? clipping.type : clipping.title, _list);
++        item->setData(detailRole, clipping.detail);
++        item->setToolTip(clipping.detail);
++    }
++    _heading->setText(_owner != nullptr ? i18np("1 finding for %2", "%1 findings for %2", live.size(), ClaudeCode::sessionTitle(_owner)) : QString());
++    _heading->setVisible(_owner != nullptr && !live.isEmpty());
++    _stack->setCurrentIndex(live.isEmpty() ? 0 : 1);
++    _send->setEnabled(!live.isEmpty());
++    _archive->setEnabled(!live.isEmpty());
++}
++
++#include "moc_clippingswidget.cpp"
+diff --git a/src/plugins/ClaudeCode/clippingswidget.h b/src/plugins/ClaudeCode/clippingswidget.h
+new file mode 100644
+index 0000000..4708195
+--- /dev/null
++++ b/src/plugins/ClaudeCode/clippingswidget.h
+@@ -0,0 +1,60 @@
++// SPDX-FileCopyrightText: 2026 Eric Duprey <509630+destinal@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#ifndef CLIPPINGSWIDGET_H
++#define CLIPPINGSWIDGET_H
++
++#include <QPointer>
++#include <QWidget>
++
++namespace Konsole
++{
++class Session;
++}
++class ClippingStore;
++class QLabel;
++class QListWidget;
++class QPushButton;
++class QStackedLayout;
++
++/**
++ * The Claude Clippings panel: the findings a code review filed for the
++ * workgroup the window is showing. Send to Chat pastes them into the Chat
++ * session, without submitting, and archives them; Archive just archives.
++ * With nothing selected, either acts on every finding.
++ */
++class ClippingsWidget : public QWidget
++{
++    Q_OBJECT
++
++public:
++    explicit ClippingsWidget(ClippingStore *store, QWidget *parent = nullptr);
++
++    /**
++     * Shows the clippings filed with @p owner, the session that keeps them
++     * (a workgroup's Chat session), which is also where they are sent.
++     */
++    void setOwner(Konsole::Session *owner);
++    Konsole::Session *owner() const;
++
++    QSize sizeHint() const override;
++
++Q_SIGNALS:
++    /** Findings were pasted into @p owner, which should now be brought forward. */
++    void sentToChat(Konsole::Session *owner);
++
++private:
++    void refresh();
++    QList<int> chosenRows() const;
++    void sendToChat(const QList<int> &rows);
++
++    ClippingStore *_store;
++    QPointer<Konsole::Session> _owner;
++    QLabel *_heading;
++    QListWidget *_list;
++    QPushButton *_send;
++    QPushButton *_archive;
++    QStackedLayout *_stack;
++};
++
++#endif // CLIPPINGSWIDGET_H
+diff --git a/src/plugins/ClaudeCode/it2/it2.cpp b/src/plugins/ClaudeCode/it2/it2.cpp
+index 154d4a0..6dc4f58 100644
+--- a/src/plugins/ClaudeCode/it2/it2.cpp
++++ b/src/plugins/ClaudeCode/it2/it2.cpp
+@@ -6,6 +6,8 @@
+ //   it2 set-status --session=<id> [--quiet-if-unresolved] [--json] [--status=...] ...
+ //   it2 session get-status --session=<id> [--quiet-if-unresolved]
+ //   it2 session get-background-tasks --session=<id> [--quiet-if-unresolved]
++//   it2 session add-clipping --session=<id> TYPE TITLE DETAIL
++//   it2 session archive-clippings --session=<id>
+ //
+ // Each becomes a call to the Claude Code plugin's D-Bus object in Konsole.
+ // The session id is what cc-status takes from $TERM_SESSION_ID, which the
+@@ -66,8 +68,14 @@ struct Invocation {
+     QString command;
+     QHash<QString, QString> options;
+     QSet<QString> flags;
++    QStringList positional;
+ };
+ 
++const QStringList sessionCommands = {QStringLiteral("get-status"),
++                                     QStringLiteral("get-background-tasks"),
++                                     QStringLiteral("add-clipping"),
++                                     QStringLiteral("archive-clippings")};
++
+ QTextStream &err()
+ {
+     static QTextStream stream(stderr);
+@@ -100,8 +108,7 @@ bool parse(const QStringList &arguments, Invocation *invocation)
+     if (arguments.value(0) == QLatin1String("set-status")) {
+         invocation->command = QStringLiteral("set-status");
+         i = 1;
+-    } else if (arguments.value(0) == QLatin1String("session")
+-               && (arguments.value(1) == QLatin1String("get-status") || arguments.value(1) == QLatin1String("get-background-tasks"))) {
++    } else if (arguments.value(0) == QLatin1String("session") && sessionCommands.contains(arguments.value(1))) {
+         invocation->command = arguments.value(1);
+         i = 2;
+     } else {
+@@ -112,8 +119,8 @@ bool parse(const QStringList &arguments, Invocation *invocation)
+     for (; i < arguments.size(); i++) {
+         const QString &argument = arguments.at(i);
+         if (!argument.startsWith(QLatin1String("--"))) {
+-            err() << "it2: unexpected argument: " << argument << Qt::endl;
+-            return false;
++            invocation->positional.append(argument);
++            continue;
+         }
+         const qsizetype separator = argument.indexOf(QLatin1Char('='));
+         const QString name = argument.mid(2, separator < 0 ? -1 : separator - 2);
+@@ -131,6 +138,15 @@ bool parse(const QStringList &arguments, Invocation *invocation)
+             return false;
+         }
+     }
++    const int expected = invocation->command == QLatin1String("add-clipping") ? 3 : 0;
++    if (invocation->positional.size() != expected) {
++        if (expected == 0) {
++            err() << "it2: unexpected argument: " << invocation->positional.value(0) << Qt::endl;
++        } else {
++            err() << "it2: add-clipping takes TYPE TITLE DETAIL" << Qt::endl;
++        }
++        return false;
++    }
+     return true;
+ }
+ 
+@@ -141,7 +157,13 @@ bool resolve(const Invocation &invocation, QString *service, QString *session)
+     if (invocation.options.contains(QStringLiteral("tmux"))) {
+         return false;
+     }
+-    const QString id = invocation.options.value(QStringLiteral("session"));
++    QString id = invocation.options.value(QStringLiteral("session"));
++    // Either what cc-status passes (the part of $TERM_SESSION_ID after its
++    // first colon) or all of $TERM_SESSION_ID, as the review prompt passes it.
++    const QLatin1String prefix("konsole:");
++    if (id.startsWith(prefix)) {
++        id.remove(0, prefix.size());
++    }
+     const qsizetype path = id.indexOf(QLatin1String("/Sessions/"));
+     if (path <= 0) {
+         return false;
+@@ -227,6 +249,12 @@ int main(int argc, char *argv[])
+         }
+         call = QDBusMessage::createMethodCall(service, path, interface, QStringLiteral("setStatus"));
+         call << session << statusArgs;
++    } else if (invocation.command == QLatin1String("add-clipping")) {
++        call = QDBusMessage::createMethodCall(service, path, interface, QStringLiteral("addClipping"));
++        call << session << invocation.positional.at(0) << invocation.positional.at(1) << invocation.positional.at(2);
++    } else if (invocation.command == QLatin1String("archive-clippings")) {
++        call = QDBusMessage::createMethodCall(service, path, interface, QStringLiteral("archiveClippings"));
++        call << session;
+     } else if (invocation.command == QLatin1String("get-status")) {
+         call = QDBusMessage::createMethodCall(service, path, interface, QStringLiteral("getStatus"));
+         call << session;
+@@ -246,7 +274,11 @@ int main(int argc, char *argv[])
+     }
+ 
+     const QVariant result = reply.arguments().value(0);
+-    if (invocation.command == QLatin1String("set-status") && !invocation.flags.contains(QStringLiteral("json"))) {
++    if (invocation.command == QLatin1String("add-clipping")) {
++        out() << "Clipping added." << Qt::endl;
++    } else if (invocation.command == QLatin1String("archive-clippings")) {
++        out() << "Clippings archived." << Qt::endl;
++    } else if (invocation.command == QLatin1String("set-status") && !invocation.flags.contains(QStringLiteral("json"))) {
+         out() << "Session status updated." << Qt::endl;
+     } else {
+         out() << result.toString() << Qt::endl;
+diff --git a/src/plugins/ClaudeCode/sessionnavigation.cpp b/src/plugins/ClaudeCode/sessionnavigation.cpp
+index 34d88b2..d84f424 100644
+--- a/src/plugins/ClaudeCode/sessionnavigation.cpp
++++ b/src/plugins/ClaudeCode/sessionnavigation.cpp
+@@ -9,8 +9,13 @@
+ #include "session/SessionController.h"
+ #include "terminalDisplay/TerminalDisplay.h"
+ 
++#include "Emulation.h"
++
+ #include <KWindowSystem>
+ 
++#include <QKeyEvent>
++#include <QPointer>
++#include <QTimer>
+ #include <QWindow>
+ 
+ namespace ClaudeCode
+@@ -47,6 +52,29 @@ bool isSessionFocused(Konsole::Session *session)
+     return false;
+ }
+ 
++void pasteIntoSession(Konsole::Session *session, QString text, bool submit)
++{
++    // What TerminalDisplay::doPaste does to pasted text.
++    text.replace(QLatin1String("\r\n"), QLatin1String("\r"));
++    text.replace(QLatin1Char('\n'), QLatin1Char('\r'));
++    text.remove(QLatin1Char('\033'));
++    const auto views = session->views();
++    if (!views.isEmpty() && views.first()->bracketedPasteMode()) {
++        text = QLatin1String("\033[200~") + text + QLatin1String("\033[201~");
++    }
++    session->sendTextToTerminal(text, QChar());
++
++    if (submit) {
++        // iTerm2 waits this long before submitting an automatic send.
++        QTimer::singleShot(501, session, [session = QPointer<Konsole::Session>(session)] {
++            if (session != nullptr) {
++                QKeyEvent enter(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier, QStringLiteral("\r"));
++                session->emulation()->sendKeyEvent(&enter);
++            }
++        });
++    }
++}
++
+ QString sessionTitle(Konsole::Session *session)
+ {
+     const auto views = session->views();
+diff --git a/src/plugins/ClaudeCode/sessionnavigation.h b/src/plugins/ClaudeCode/sessionnavigation.h
+index e2f67ef..227d0f9 100644
+--- a/src/plugins/ClaudeCode/sessionnavigation.h
++++ b/src/plugins/ClaudeCode/sessionnavigation.h
+@@ -25,6 +25,14 @@ bool isSessionFocused(Konsole::Session *session);
+ 
+ /** The title shown on the session's tab, or its name when it has no view. */
+ QString sessionTitle(Konsole::Session *session);
++
++/**
++ * Types @p text into @p session the way a paste does: bracketed when the
++ * program asked for bracketed paste, line breaks as carriage returns, no
++ * escape characters. With @p submit, presses Return a moment later, once the
++ * program has taken the paste in.
++ */
++void pasteIntoSession(Konsole::Session *session, QString text, bool submit);
+ }
+ 
+ #endif // SESSIONNAVIGATION_H
+diff --git a/src/plugins/ClaudeCode/workgroup/code-review-settings.json b/src/plugins/ClaudeCode/workgroup/code-review-settings.json
+new file mode 100644
+index 0000000..f128d78
+--- /dev/null
++++ b/src/plugins/ClaudeCode/workgroup/code-review-settings.json
+@@ -0,0 +1 @@
++{"autoMode":{"allow":["$defaults","Running `it2 session add-clipping` or `it2 session archive-clippings` is allowed: it files review findings with the local Konsole session per the user's request."]}}
+diff --git a/src/plugins/ClaudeCode/workgroup/code-review-system-prompt.txt b/src/plugins/ClaudeCode/workgroup/code-review-system-prompt.txt
+new file mode 100644
+index 0000000..a799f5f
+--- /dev/null
++++ b/src/plugins/ClaudeCode/workgroup/code-review-system-prompt.txt
+@@ -0,0 +1,36 @@
++The Konsole Claude Code integration is installed.
++
++At the very beginning of any code review (before writing any new clippings), archive the existing clippings so previous round's findings are preserved as history but cleared from the live list:
++
++```
++it2 session archive-clippings --session=$TERM_SESSION_ID
++```
++
++Run this exactly once per review, before producing any new findings. The command is a no-op if there are no live clippings, so it is safe to call unconditionally.
++
++When performing a code review, submit findings that need attention using the it2 command as follows:
++
++```
++it2 session add-clipping --session=$TERM_SESSION_ID {TYPE} {TITLE} {DETAIL}
++```
++
++{TYPE} is always the literal string "Code Review Comment".
++
++{TITLE} is a brief 1-line headline, such as "Memory Leak in SomeFunction()"
++
++{DETAIL} is the full description of the problem. You can use markdown here as you would in the Claude Code CLI. Begin with a succinct description of the problem. This should be a prompt to give an agent that will fix the issue. Assume the agent wrote the buggy code, so you don't need to explain how everything works - focus on what is wrong, why it is wrong, and how it might be fixed.
++
++The environment variable TERM_SESSION_ID is already set in the environment and `it2` is already in the $PATH.
++
++You should also produce the same output to the CLI as you normally would. This is purely additive. If a skill calls for machine-readable output (such as a findings JSON array), the clippings satisfy that requirement; the CLI message should be prose written for a human.
++
++Here is an example of a well-formed call. I recommend using a heredoc to simplify quoting of long strings.
++
++```
++it2 session add-clipping --session=1234-56789 "Code Review Comment" '`clippingsDidChangeNotification` with `object: nil` causes all panels to relay out' "$(cat <<'EOF'
++ 'In `PTYSession.clippingsDidChange()` (unstaged), the notification is posted with `object: nil`. Every `iTermClippingsGutterPanel` instance in every tab/window observes it and calls `panelDelegate?.rightGutterPanelDidChangeWidthOrVisibility(self)`. In a multi-tab window each panel will trigger a separate layout cascade. Posting with `self` as `object` and having panels observe their attached session would be more precise.
++EOF
++)"
++```
++
++You can omit this call for positive findings that do not require action.
+diff --git a/src/plugins/ClaudeCode/workgroupmanager.cpp b/src/plugins/ClaudeCode/workgroupmanager.cpp
+index bd1d070..a0ff96f 100644
+--- a/src/plugins/ClaudeCode/workgroupmanager.cpp
++++ b/src/plugins/ClaudeCode/workgroupmanager.cpp
+@@ -2,6 +2,9 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "workgroupmanager.h"
++#include "clippingstore.h"
++#include "sessionnavigation.h"
++#include "sessionstatus.h"
+ #include "sessionstatusregistry.h"
+ 
+ #include "ProgramStatus.h"
+@@ -28,11 +31,63 @@ constexpr int exitCheckIntervalMs = 250;
+ constexpr int exitCheckAttempts = 40;
+ }
+ 
+-WorkgroupManager::WorkgroupManager(SessionStatusRegistry *registry, QObject *parent)
++WorkgroupManager::WorkgroupManager(SessionStatusRegistry *registry, ClippingStore *clippings, QObject *parent)
+     : QObject(parent)
++    , _registry(registry)
++    , _clippings(clippings)
+     , _autoEnter(settings().readEntry("AutoEnterWorkgroup", true))
++    , _autoSend(settings().readEntry("AutoSendClippings", false))
+ {
+     connect(registry, &SessionStatusRegistry::programStatusReported, this, &WorkgroupManager::programStatusReported);
++    connect(registry, &SessionStatusRegistry::statusChanged, this, &WorkgroupManager::statusChanged);
++}
++
++bool WorkgroupManager::autoSend() const
++{
++    return _autoSend;
++}
++
++void WorkgroupManager::setAutoSend(bool enabled)
++{
++    if (_autoSend == enabled) {
++        return;
++    }
++    _autoSend = enabled;
++    KConfigGroup group = settings();
++    group.writeEntry("AutoSendClippings", enabled);
++    group.sync();
++    Q_EMIT autoSendChanged(enabled);
++}
++
++void WorkgroupManager::statusChanged(Konsole::Session *session, const std::optional<QString> &previousStatusText)
++{
++    Workgroup *workgroup = this->workgroup(session);
++    if (!_autoSend || workgroup == nullptr || workgroup->session(Workgroup::Review) != session) {
++        return;
++    }
++    // Only the review going from working to finished, as in iTerm2.
++    const auto lower = [](const std::optional<QString> &text) {
++        return text.value_or(QString()).toLower();
++    };
++    const QString now = lower(_registry->status(session)->statusText());
++    if (lower(previousStatusText) != QLatin1String("working")
++        || (now != QLatin1String("idle") && now != QLatin1String("done") && now != QLatin1String("error"))) {
++        return;
++    }
++    // Never into a turn that is still running.
++    Konsole::Session *chat = workgroup->session(Workgroup::Chat);
++    SessionStatus *chatStatus = chat != nullptr ? _registry->status(chat) : nullptr;
++    if (chatStatus == nullptr || lower(chatStatus->statusText()) == QLatin1String("working")) {
++        return;
++    }
++    const QList<Clipping> live = _clippings->live(chat);
++    if (live.isEmpty()) {
++        return;
++    }
++    // Archiving them is what keeps this from sending the same findings twice.
++    ClaudeCode::pasteIntoSession(chat, ClippingStore::formatted(live), true);
++    _clippings->archive(chat);
++    workgroup->show(Workgroup::Chat);
+ }
+ 
+ QString WorkgroupManager::toolsDirectory()
+diff --git a/src/plugins/ClaudeCode/workgroupmanager.h b/src/plugins/ClaudeCode/workgroupmanager.h
+index c41b082..2865c4d 100644
+--- a/src/plugins/ClaudeCode/workgroupmanager.h
++++ b/src/plugins/ClaudeCode/workgroupmanager.h
+@@ -15,6 +15,7 @@ namespace Konsole
+ class Session;
+ struct ProgramStatusReport;
+ }
++class ClippingStore;
+ class SessionStatusRegistry;
+ 
+ /**
+@@ -23,13 +24,17 @@ class SessionStatusRegistry;
+  * enters a workgroup when Claude Code starts in it, which Claude Code's first
+  * program status report (OSC 7501, app=claude-code) shows, and leaves it when
+  * Claude Code exits there.
++ *
++ * With automatic sending on (off by default, [ClaudeCode] AutoSendClippings),
++ * when a workgroup's code review finishes while Chat is not working, its
++ * findings are pasted into Chat and submitted, then archived.
+  */
+ class WorkgroupManager : public QObject
+ {
+     Q_OBJECT
+ 
+ public:
+-    explicit WorkgroupManager(SessionStatusRegistry *registry, QObject *parent = nullptr);
++    WorkgroupManager(SessionStatusRegistry *registry, ClippingStore *clippings, QObject *parent = nullptr);
+ 
+     /** The workgroup @p session belongs to, or nullptr. */
+     Workgroup *workgroup(Konsole::Session *session) const;
+@@ -43,18 +48,26 @@ public:
+     bool autoEnter() const;
+     void setAutoEnter(bool enabled);
+ 
++    bool autoSend() const;
++    void setAutoSend(bool enabled);
++
+     /** The directory holding the member scripts and it2. */
+     static QString toolsDirectory();
+ 
+ Q_SIGNALS:
+     void autoEnterChanged(bool enabled);
++    void autoSendChanged(bool enabled);
+ 
+ private:
+     void programStatusReported(Konsole::Session *session, const Konsole::ProgramStatusReport &report);
+     void checkForExit(const QPointer<Konsole::Session> &session, int attemptsLeft);
++    void statusChanged(Konsole::Session *session, const std::optional<QString> &previousStatusText);
+ 
++    SessionStatusRegistry *_registry;
++    ClippingStore *_clippings;
+     QList<Workgroup *> _workgroups;
+     bool _autoEnter;
++    bool _autoSend;
+ };
+ 
+ #endif // WORKGROUPMANAGER_H
+-- 
+2.56.0
+
