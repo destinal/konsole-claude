@@ -1,0 +1,194 @@
+From cc4680e26a85eaf58007ee59a1fe064d51cce7fe Mon Sep 17 00:00:00 2001
+From: Eric Duprey <509630+destinal@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 16:22:53 -0700
+Subject: [PATCH 20/20] Claude Code plugin: forget a session's status when
+ Claude Code exits
+
+When Claude Code exits it clears its OSC 7501 records, but its SessionEnd
+hook leaves the session idle, so the session stayed in the sessions panel
+with a dot on its tab long after only the shell was left. iTerm2 keeps it
+listed the same way.
+
+Once the program that cleared its status has left the foreground, the
+registry now clears the session's status as well and says so with
+programLeft, which also ends the workgroup in place of the workgroup
+manager's own check.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../ClaudeCode/sessionstatusregistry.cpp      | 34 ++++++++++++++++++
+ .../ClaudeCode/sessionstatusregistry.h        | 10 ++++++
+ src/plugins/ClaudeCode/workgroupmanager.cpp   | 35 +++++--------------
+ src/plugins/ClaudeCode/workgroupmanager.h     |  1 -
+ 4 files changed, 52 insertions(+), 28 deletions(-)
+
+diff --git a/src/plugins/ClaudeCode/sessionstatusregistry.cpp b/src/plugins/ClaudeCode/sessionstatusregistry.cpp
+index 4685d39..ecf1772 100644
+--- a/src/plugins/ClaudeCode/sessionstatusregistry.cpp
++++ b/src/plugins/ClaudeCode/sessionstatusregistry.cpp
+@@ -9,6 +9,17 @@
+ #include "session/Session.h"
+ #include "session/SessionManager.h"
+ 
++#include <QTimer>
++
++namespace
++{
++// After a program clears its status, how often and for how long to look for
++// its exit: Claude Code may still be running its SessionEnd hooks, which
++// report too.
++constexpr int exitCheckIntervalMs = 250;
++constexpr int exitCheckAttempts = 40;
++}
++
+ SessionStatusRegistry::SessionStatusRegistry(QObject *parent)
+     : QObject(parent)
+ {
+@@ -65,6 +76,11 @@ void SessionStatusRegistry::track(Konsole::Session *session)
+     connect(emulation, &Konsole::Emulation::programStatusReported, programStatus, &ProgramStatusController::handle);
+     connect(emulation, &Konsole::Emulation::programStatusReported, this, [this, session](const Konsole::ProgramStatusReport &report) {
+         Q_EMIT programStatusReported(session, report);
++        // Claude Code clears its records when it exits; a clear of a task's
++        // record (with an id) is not that.
++        if (report.id.isEmpty() && report.state == Konsole::ProgramStatusReport::Clear) {
++            checkForExit(QPointer<Konsole::Session>(session), exitCheckAttempts);
++        }
+     });
+     connect(emulation, &Konsole::Emulation::promptStarted, programStatus, &ProgramStatusController::promptStarted);
+     connect(emulation, &Konsole::Emulation::terminalReset, programStatus, &ProgramStatusController::terminalReset);
+@@ -82,4 +98,22 @@ void SessionStatusRegistry::track(Konsole::Session *session)
+     });
+ }
+ 
++void SessionStatusRegistry::checkForExit(const QPointer<Konsole::Session> &session, int attemptsLeft)
++{
++    QTimer::singleShot(exitCheckIntervalMs, this, [this, session, attemptsLeft] {
++        if (session == nullptr || !_sessions.contains(session)) {
++            return;
++        }
++        // Nothing but the shell left in the foreground: the program is gone,
++        // and what its hooks said last (idle, mostly) is no longer about
++        // anything.
++        if (session->foregroundProcessId() == session->processId()) {
++            status(session)->clearStatus();
++            Q_EMIT programLeft(session);
++        } else if (attemptsLeft > 1) {
++            checkForExit(session, attemptsLeft - 1);
++        }
++    });
++}
++
+ #include "moc_sessionstatusregistry.cpp"
+diff --git a/src/plugins/ClaudeCode/sessionstatusregistry.h b/src/plugins/ClaudeCode/sessionstatusregistry.h
+index 413d63b..63ed3c8 100644
+--- a/src/plugins/ClaudeCode/sessionstatusregistry.h
++++ b/src/plugins/ClaudeCode/sessionstatusregistry.h
+@@ -6,6 +6,7 @@
+ 
+ #include <QHash>
+ #include <QObject>
++#include <QPointer>
+ #include <QString>
+ 
+ #include <optional>
+@@ -51,8 +52,17 @@ Q_SIGNALS:
+     /** @p session's program sent a Program Status Protocol report (OSC 7501). */
+     void programStatusReported(Konsole::Session *session, const Konsole::ProgramStatusReport &report);
+ 
++    /**
++     * The program reporting in @p session over OSC 7501, Claude Code above
++     * all, cleared its status and exited, leaving only the shell. Its status
++     * has been cleared too, so the session no longer counts as a Claude Code
++     * session.
++     */
++    void programLeft(Konsole::Session *session);
++
+ private:
+     void track(Konsole::Session *session);
++    void checkForExit(const QPointer<Konsole::Session> &session, int attemptsLeft);
+ 
+     struct Tracked {
+         SessionStatus *status;
+diff --git a/src/plugins/ClaudeCode/workgroupmanager.cpp b/src/plugins/ClaudeCode/workgroupmanager.cpp
+index a0ff96f..f54c706 100644
+--- a/src/plugins/ClaudeCode/workgroupmanager.cpp
++++ b/src/plugins/ClaudeCode/workgroupmanager.cpp
+@@ -24,11 +24,6 @@ KConfigGroup settings()
+ {
+     return KSharedConfig::openConfig()->group(QStringLiteral("ClaudeCode"));
+ }
+-
+-// After Claude Code clears its status, how often and for how long to look for
+-// its exit: it may still be running its SessionEnd hooks.
+-constexpr int exitCheckIntervalMs = 250;
+-constexpr int exitCheckAttempts = 40;
+ }
+ 
+ WorkgroupManager::WorkgroupManager(SessionStatusRegistry *registry, ClippingStore *clippings, QObject *parent)
+@@ -40,6 +35,13 @@ WorkgroupManager::WorkgroupManager(SessionStatusRegistry *registry, ClippingStor
+ {
+     connect(registry, &SessionStatusRegistry::programStatusReported, this, &WorkgroupManager::programStatusReported);
+     connect(registry, &SessionStatusRegistry::statusChanged, this, &WorkgroupManager::statusChanged);
++    connect(registry, &SessionStatusRegistry::programLeft, this, [this](Konsole::Session *session) {
++        // Only the Chat member's Claude Code ends the workgroup.
++        Workgroup *current = workgroup(session);
++        if (current != nullptr && current->session(Workgroup::Chat) == session) {
++            exit(session);
++        }
++    });
+ }
+ 
+ bool WorkgroupManager::autoSend() const
+@@ -147,21 +149,6 @@ void WorkgroupManager::setAutoEnter(bool enabled)
+     Q_EMIT autoEnterChanged(enabled);
+ }
+ 
+-void WorkgroupManager::checkForExit(const QPointer<Konsole::Session> &session, int attemptsLeft)
+-{
+-    QTimer::singleShot(exitCheckIntervalMs, this, [this, session, attemptsLeft] {
+-        if (session == nullptr || workgroup(session) == nullptr) {
+-            return;
+-        }
+-        // Nothing but the shell left in the foreground: Claude Code is gone.
+-        if (session->foregroundProcessId() == session->processId()) {
+-            exit(session);
+-        } else if (attemptsLeft > 1) {
+-            checkForExit(session, attemptsLeft - 1);
+-        }
+-    });
+-}
+-
+ void WorkgroupManager::programStatusReported(Konsole::Session *session, const Konsole::ProgramStatusReport &report)
+ {
+     if (!report.id.isEmpty()) {
+@@ -170,14 +157,8 @@ void WorkgroupManager::programStatusReported(Konsole::Session *session, const Ko
+     QPointer<Konsole::Session> guarded(session);
+     Workgroup *current = workgroup(session);
+ 
++    // Claude Code exiting ends the workgroup through the registry's programLeft.
+     if (report.state == Konsole::ProgramStatusReport::Clear) {
+-        // Claude Code clears its records when it exits; a clear carries no
+-        // app. Only the Chat member's Claude Code ends the workgroup, and only
+-        // once nothing runs in the session's shell any more.
+-        if (current == nullptr || current->session(Workgroup::Chat) != session) {
+-            return;
+-        }
+-        checkForExit(guarded, exitCheckAttempts);
+         return;
+     }
+ 
+diff --git a/src/plugins/ClaudeCode/workgroupmanager.h b/src/plugins/ClaudeCode/workgroupmanager.h
+index 2865c4d..9fddeaa 100644
+--- a/src/plugins/ClaudeCode/workgroupmanager.h
++++ b/src/plugins/ClaudeCode/workgroupmanager.h
+@@ -60,7 +60,6 @@ Q_SIGNALS:
+ 
+ private:
+     void programStatusReported(Konsole::Session *session, const Konsole::ProgramStatusReport &report);
+-    void checkForExit(const QPointer<Konsole::Session> &session, int attemptsLeft);
+     void statusChanged(Konsole::Session *session, const std::optional<QString> &previousStatusText);
+ 
+     SessionStatusRegistry *_registry;
+-- 
+2.56.0
+

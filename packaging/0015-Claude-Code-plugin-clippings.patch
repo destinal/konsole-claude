@@ -1,7 +1,7 @@
 From e524c21d0ef6733b4de9d886890e73bed8e19589 Mon Sep 17 00:00:00 2001
 From: Eric Duprey <509630+destinal@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 14:50:37 -0700
-Subject: [PATCH 15/19] Claude Code plugin: clippings
+Subject: [PATCH 15/20] Claude Code plugin: clippings
 
 A code review in a workgroup files its findings as clippings, as in
 iTerm2, kept by the workgroup's Chat session:

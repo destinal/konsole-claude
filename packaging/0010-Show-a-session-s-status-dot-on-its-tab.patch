@@ -1,7 +1,7 @@
 From 0acaa7c324cb86b7737d6271b7563bdc4620b87b Mon Sep 17 00:00:00 2001
 From: Eric Duprey <509630+destinal@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 14:08:28 -0700
-Subject: [PATCH 10/19] Show a session's status dot on its tab
+Subject: [PATCH 10/20] Show a session's status dot on its tab
 
 Session::setStatusIndicator gives a session a colored dot, which its tab
 shows in place of its icon. It is meant for plugins that track what the

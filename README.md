@@ -50,7 +50,7 @@ one needs you, and work with a diff and a code review next to the chat.
 
 The changes to Konsole are the `claude-integration` branch of
 [destinal/konsole](https://github.com/destinal/konsole/tree/claude-integration),
-19 commits on top of Konsole 26.08.2. [`packaging/`](packaging/)
+20 commits on top of Konsole 26.08.2. [`packaging/`](packaging/)
 holds the same changes as patches.
 
 ## Install (Arch Linux)
