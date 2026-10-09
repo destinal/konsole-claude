@@ -1,0 +1,21 @@
+post_install() {
+    cat <<'MSG'
+==> Konsole now has a Claude Code integration (Plugins menu).
+    Add its hooks to Claude Code's settings, for each user who wants them:
+        konsole-claude-setup install
+    or use Install Hooks in the Claude Sessions panel (Ctrl+Shift+F3).
+    Before removing this package, run: konsole-claude-setup uninstall
+MSG
+}
+
+post_upgrade() {
+    :
+}
+
+pre_remove() {
+    cat <<'MSG'
+==> Claude Code's settings may still run Konsole's claude-code-hook.
+    Remove it with: konsole-claude-setup uninstall (before uninstalling),
+    or delete the hooks running claude-code-hook from ~/.claude/settings.json.
+MSG
+}

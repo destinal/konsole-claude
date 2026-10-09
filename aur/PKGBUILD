@@ -1,0 +1,97 @@
+# Maintainer: Eric Duprey <509630+destinal@users.noreply.github.com>
+# Based on Arch Linux's konsole package (Felix Yan, Antonio Rojas).
+#
+# Konsole with a Claude Code integration modeled on iTerm2's: status on tabs,
+# a sessions panel and notifications, workgroups (Chat, Diff, Code Review)
+# and review clippings. https://github.com/destinal/konsole-claude
+#
+# The patches and cc-status come from the konsole-claude release tagged
+# v$pkgver-$pkgrel; the changes themselves are the claude-integration branch of
+# https://github.com/destinal/konsole.
+
+pkgname=konsole-claude
+_pkgname=konsole
+pkgver=26.08.2
+pkgrel=1
+arch=(x86_64)
+url='https://github.com/destinal/konsole-claude'
+pkgdesc='KDE terminal emulator, with a Claude Code integration'
+license=(GPL-2.0-or-later
+         LGPL-2.0-or-later
+         GPL-2.0-only) # cc-status and parts of the plugin, from iTerm2
+depends=(glibc
+         icu
+         kbookmarks
+         kcolorscheme
+         kconfig
+         kconfigwidgets
+         kcoreaddons
+         kcrash
+         kdbusaddons
+         kglobalaccel
+         kguiaddons
+         ki18n
+         kiconthemes
+         kio
+         knewstuff
+         knotifications
+         knotifyconfig
+         kparts
+         kpty
+         kservice
+         ktextwidgets
+         kwidgetsaddons
+         kwindowsystem
+         kxmlgui
+         libssh
+         libstdc++
+         libxkbcommon
+         python
+         qt6-base
+         qt6-multimedia
+         sh)
+makedepends=(extra-cmake-modules
+             kdoctools
+             swift-language)
+optdepends=('keditbookmarks: to manage bookmarks'
+            'vim: the default viewer of a Claude workgroup'"'"'s Diff member'
+            'git: the Diff member of Claude workgroups')
+provides=("konsole=$pkgver")
+conflicts=(konsole)
+install=konsole-claude.install
+source=(https://download.kde.org/stable/release-service/$pkgver/src/$_pkgname-$pkgver.tar.xz{,.sig}
+        "$pkgname-$pkgver-$pkgrel.tar.gz::https://github.com/destinal/konsole-claude/archive/refs/tags/v$pkgver-$pkgrel.tar.gz")
+sha256sums=()
+validpgpkeys=(CA262C6C83DE4D2FB28A332A3A6A4DB839EAA6D7  # Albert Astals Cid <aacid@kde.org>
+              F23275E4BF10AFC1DF6914A6DBD2CE893E2D1C87  # Christoph Feck <cfeck@kde.org>
+              D81C0CB38EB725EF6691C385BB463350D6EF31EF) # Heiko Becker <heiko.becker@kde.org>
+
+prepare() {
+  cd $_pkgname-$pkgver
+  for patch in "$srcdir"/$pkgname-$pkgver-$pkgrel/packaging/[0-9][0-9][0-9][0-9]-*.patch; do
+    patch -Np1 -i "$patch"
+  done
+}
+
+build() {
+  cmake -B build -S $_pkgname-$pkgver \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DBUILD_TESTING=OFF
+  cmake --build build
+
+  # Statically linked, so it needs no Swift runtime once installed.
+  cd $pkgname-$pkgver-$pkgrel/cc-status
+  swift build -c release --static-swift-stdlib \
+    -Xlinker -lCoreFoundation -Xlinker -l_FoundationICU -Xlinker -l_FoundationCShims \
+    -Xlinker -l_FoundationCollections -Xlinker -lFoundationEssentials \
+    -Xlinker -lFoundationInternationalization -Xlinker -lswiftSynchronization
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+
+  # cc-status goes beside it2 and the hook, wherever the build put them.
+  local tools
+  tools=$(dirname "$(find "$pkgdir" -path '*/konsole-claudecode/it2' | head -1)")
+  install -Dm755 $pkgname-$pkgver-$pkgrel/cc-status/.build/release/cc-status "$tools/cc-status"
+}

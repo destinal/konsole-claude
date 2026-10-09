@@ -115,6 +115,15 @@ covers most of iTerm2's integration; not yet:
 - Codex CLI hooks, which `cc-status` supports but the setup does not install,
 - iTerm2's workgroup editor, git and usage toolbar items, and the Orchestrator.
 
+Possible next steps:
+
+- Offer KDE the changes to Konsole that are useful on their own: all OSC 9;4
+  progress states, `SetUserVar`, the Program Status Protocol (OSC 7501), the
+  session-created signal and the status dot on tabs. The plugin itself would
+  stay here, since parts of it are GPL-2.0-only.
+- Offer iTerm2 the Linux port of `cc-status`, so it can be built from iTerm2's
+  source directly.
+
 ## Credits and licenses
 
 - [Konsole](https://invent.kde.org/utilities/konsole) by the KDE community,
