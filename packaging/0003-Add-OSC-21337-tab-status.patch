@@ -1,7 +1,7 @@
 From ec4dbd88f695a5caa6cd04e39d9bb07057ba943e Mon Sep 17 00:00:00 2001
 From: Eric Duprey <509630+destinal@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 13:01:31 -0700
-Subject: [PATCH 03/17] Add OSC 21337 tab status
+Subject: [PATCH 03/18] Add OSC 21337 tab status
 
 iTerm2 3.7 lets programs report a session's status with OSC 21337, and
 its Claude Code integration uses this to show whether a session is

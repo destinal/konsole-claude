@@ -1,0 +1,265 @@
+From 32e9e747f3a808fc18fa1b7c2ebaee85d36c8489 Mon Sep 17 00:00:00 2001
+From: Eric Duprey <509630+destinal@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 15:59:35 -0700
+Subject: [PATCH 18/18] Claude Code plugin: keep the last status detail on
+ screen
+
+Claude Code reports what a tool is doing only while it runs, and its own
+done report carries no message, so the detail line blinked and the Stop
+hook's summary of the turn could be wiped by the report that followed it.
+
+Sessions now keep showing the last detail until the status itself changes,
+or a finished turn the user has seen becomes idle, as iTerm2 keeps its
+summary. Only the panel, its tooltips and notifications use it: the status
+model and it2 session get-status keep iTerm2's semantics.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../autotests/SessionStatusTest.cpp           | 92 +++++++++++++++++++
+ .../ClaudeCode/claudesessionsmodel.cpp        |  6 +-
+ src/plugins/ClaudeCode/sessionstatus.cpp      | 23 ++++-
+ src/plugins/ClaudeCode/sessionstatus.h        | 11 +++
+ src/plugins/ClaudeCode/statusnotifier.cpp     |  2 +-
+ 5 files changed, 129 insertions(+), 5 deletions(-)
+
+diff --git a/src/plugins/ClaudeCode/autotests/SessionStatusTest.cpp b/src/plugins/ClaudeCode/autotests/SessionStatusTest.cpp
+index df2ad57..eee7649 100644
+--- a/src/plugins/ClaudeCode/autotests/SessionStatusTest.cpp
++++ b/src/plugins/ClaudeCode/autotests/SessionStatusTest.cpp
+@@ -153,6 +153,13 @@ private Q_SLOTS:
+ 
+     // OSC 21337.
+     void testTabStatusUpdateConverts();
++
++    // The shown detail, which iTerm2's model does not have.
++    void testClearedDetailStaysShownWhileTheStatusHolds();
++    void testBareDoneKeepsTheSummaryEitherWayRound();
++    void testNewStatusDropsTheShownDetail();
++    void testSeenResultKeepsItsSummary();
++    void testClearAndExitDropTheShownDetail();
+ };
+ 
+ void SessionStatusTest::testTurnOpenArgument()
+@@ -753,6 +760,91 @@ void SessionStatusTest::testTabStatusUpdateConverts()
+     QVERIFY(!status.hasActiveStatus());
+ }
+ 
++namespace
++{
++StatusUpdate withDetail(const QString &status, const QString &detail)
++{
++    StatusUpdate update = withStatus(status);
++    update.fields.detail = detail;
++    return update;
++}
++}
++
++void SessionStatusTest::testClearedDetailStaysShownWhileTheStatusHolds()
++{
++    // A tool's description while it runs, then the bare report when it ends.
++    SessionStatus status;
++    status.apply(withDetail(QStringLiteral("working"), QStringLiteral("Running the tests")));
++    QSignalSpy changed(&status, &SessionStatus::changed);
++    status.apply(withDetail(QStringLiteral("working"), QString()));
++    QCOMPARE(status.detail(), std::nullopt);
++    QCOMPARE(status.shownDetail(), QStringLiteral("Running the tests"));
++    QCOMPARE(status.toJson().value(QStringLiteral("detail")).isNull(), true);
++    // Only the detail changed, and the shown one did not.
++    QCOMPARE(changed.count(), 1);
++
++    // The next tool's description replaces it.
++    status.apply(withDetail(QStringLiteral("working"), QStringLiteral("Reading main.cpp")));
++    QCOMPARE(status.shownDetail(), QStringLiteral("Reading main.cpp"));
++}
++
++void SessionStatusTest::testBareDoneKeepsTheSummaryEitherWayRound()
++{
++    // The Stop hook's summary, then Claude Code's own done report.
++    SessionStatus hookFirst;
++    hookFirst.apply(withDetail(QStringLiteral("working"), QStringLiteral("Running the tests")));
++    hookFirst.apply(withDetail(QStringLiteral("done"), QStringLiteral("Fixed the parser")));
++    hookFirst.apply(withDetail(QStringLiteral("done"), QString()));
++    QCOMPARE(hookFirst.shownDetail(), QStringLiteral("Fixed the parser"));
++
++    // The other way round: the done report ends the tool's description, and
++    // the summary arrives after it.
++    SessionStatus reportFirst;
++    reportFirst.apply(withDetail(QStringLiteral("working"), QStringLiteral("Running the tests")));
++    reportFirst.apply(withDetail(QStringLiteral("done"), QString()));
++    QCOMPARE(reportFirst.shownDetail(), std::nullopt);
++    reportFirst.apply(withDetail(QStringLiteral("done"), QStringLiteral("Fixed the parser")));
++    QCOMPARE(reportFirst.shownDetail(), QStringLiteral("Fixed the parser"));
++}
++
++void SessionStatusTest::testNewStatusDropsTheShownDetail()
++{
++    SessionStatus status;
++    status.apply(withDetail(QStringLiteral("done"), QStringLiteral("Fixed the parser")));
++    status.apply(withDetail(QStringLiteral("working"), QString()));
++    QCOMPARE(status.shownDetail(), std::nullopt);
++
++    // Interrupted: idle after working is not a result being seen.
++    status.apply(withDetail(QStringLiteral("working"), QStringLiteral("Running the tests")));
++    status.apply(withDetail(QStringLiteral("idle"), QString()));
++    QCOMPARE(status.shownDetail(), std::nullopt);
++}
++
++void SessionStatusTest::testSeenResultKeepsItsSummary()
++{
++    // A summary only the shown detail still holds survives the key press.
++    SessionStatus status;
++    status.apply(withDetail(QStringLiteral("done"), QStringLiteral("Fixed the parser")));
++    status.apply(withDetail(QStringLiteral("done"), QString()));
++    status.userDidPressKey();
++    QCOMPARE(text(status), QStringLiteral("idle"));
++    QCOMPARE(status.shownDetail(), QStringLiteral("Fixed the parser"));
++}
++
++void SessionStatusTest::testClearAndExitDropTheShownDetail()
++{
++    SessionStatus cleared;
++    cleared.apply(withDetail(QStringLiteral("working"), QStringLiteral("Running the tests")));
++    cleared.apply(withDetail(QStringLiteral("working"), QString()));
++    QVERIFY(cleared.clearStatus());
++    QCOMPARE(cleared.shownDetail(), std::nullopt);
++
++    SessionStatus exited;
++    exited.apply(withDetail(QStringLiteral("working"), QStringLiteral("Running the tests")));
++    exited.programDidExit();
++    QCOMPARE(exited.shownDetail(), std::nullopt);
++}
++
+ QTEST_GUILESS_MAIN(SessionStatusTest)
+ 
+ #include "SessionStatusTest.moc"
+diff --git a/src/plugins/ClaudeCode/claudesessionsmodel.cpp b/src/plugins/ClaudeCode/claudesessionsmodel.cpp
+index 0acc34f..62742a0 100644
+--- a/src/plugins/ClaudeCode/claudesessionsmodel.cpp
++++ b/src/plugins/ClaudeCode/claudesessionsmodel.cpp
+@@ -43,8 +43,8 @@ QVariant ClaudeSessionsModel::data(const QModelIndex &index, int role) const
+         return ClaudeCode::sessionTitle(session);
+     case Qt::ToolTipRole: {
+         QString tip = ClaudeCode::sessionTitle(session) + QLatin1String(" — ") + status->statusText().value_or(QString());
+-        if (status->detail().has_value()) {
+-            tip += QLatin1Char('\n') + *status->detail();
++        if (status->shownDetail().has_value()) {
++            tip += QLatin1Char('\n') + *status->shownDetail();
+         }
+         return tip;
+     }
+@@ -55,7 +55,7 @@ QVariant ClaudeSessionsModel::data(const QModelIndex &index, int role) const
+     case IndicatorRole:
+         return status->indicator();
+     case DetailRole:
+-        return status->detail().value_or(QString());
++        return status->shownDetail().value_or(QString());
+     case SessionRole:
+         return QVariant::fromValue<QObject *>(session);
+     }
+diff --git a/src/plugins/ClaudeCode/sessionstatus.cpp b/src/plugins/ClaudeCode/sessionstatus.cpp
+index cc89280..d065d0e 100644
+--- a/src/plugins/ClaudeCode/sessionstatus.cpp
++++ b/src/plugins/ClaudeCode/sessionstatus.cpp
+@@ -20,6 +20,13 @@ namespace
+ const QColor idleIndicator(0x00, 0xd7, 0x5f);
+ const QColor idleStatusColor(0x88, 0x88, 0x88);
+ 
++// A finished turn the user has seen: its summary is still worth showing.
++bool isSeenResult(const std::optional<QString> &before, const std::optional<QString> &after)
++{
++    const QString from = before.value_or(QString()).toLower();
++    return (from == QLatin1String("done") || from == QLatin1String("error")) && after.value_or(QString()).toLower() == QLatin1String("idle");
++}
++
+ std::optional<QString> stringArgument(const QVariantMap &arguments, const char *key)
+ {
+     const auto it = arguments.constFind(QLatin1String(key));
+@@ -196,6 +203,11 @@ std::optional<QString> SessionStatus::detail() const
+     return _display.detail;
+ }
+ 
++std::optional<QString> SessionStatus::shownDetail() const
++{
++    return _shownDetail;
++}
++
+ qint64 SessionStatus::backgroundTasks() const
+ {
+     return _backgroundTasks;
+@@ -313,7 +325,14 @@ bool SessionStatus::applyFields(const TabStatusFields &fields)
+     if (fields.detail.has_value()) {
+         _display.detail = fields.detail->isEmpty() ? std::nullopt : fields.detail;
+     }
+-    return !(_display == before);
++
++    const auto shownBefore = _shownDetail;
++    if (_display.detail.has_value()) {
++        _shownDetail = _display.detail;
++    } else if (_display.statusText != before.statusText && !isSeenResult(before.statusText, _display.statusText)) {
++        _shownDetail.reset();
++    }
++    return !(_display == before) || _shownDetail != shownBefore;
+ }
+ 
+ void SessionStatus::progressReported(const std::optional<TerminalProgress> &progress)
+@@ -393,6 +412,7 @@ bool SessionStatus::clearStatus()
+     ++_generation;
+     const auto previousText = _display.statusText;
+     _display = Display();
++    _shownDetail.reset();
+     _backgroundTasks = 0;
+     _turnOpen.reset();
+     Q_EMIT changed(previousText);
+@@ -404,6 +424,7 @@ void SessionStatus::programDidExit()
+     const bool wasActive = hasActiveStatus();
+     const auto previousText = _display.statusText;
+     _display = Display();
++    _shownDetail.reset();
+     _backgroundTasks = 0;
+     _turnOpen.reset();
+     _armedFallback.reset();
+diff --git a/src/plugins/ClaudeCode/sessionstatus.h b/src/plugins/ClaudeCode/sessionstatus.h
+index f30f299..5e1c504 100644
+--- a/src/plugins/ClaudeCode/sessionstatus.h
++++ b/src/plugins/ClaudeCode/sessionstatus.h
+@@ -88,6 +88,16 @@ public:
+     /** Invalid when there is no status text color. */
+     QColor statusColor() const;
+     std::optional<QString> detail() const;
++    /**
++     * The detail to show people: the detail, or when an update cleared it
++     * without changing the status, the last one there was. Claude Code
++     * reports what a tool is doing only while it runs, and its own done
++     * report carries no message, so the detail alone would blink and lose
++     * the turn's summary. A new status clears it, except a finished one the
++     * user has seen, which keeps its summary as iTerm2's does. Not part of
++     * iTerm2's model, so detail() and toJson() leave it out.
++     */
++    std::optional<QString> shownDetail() const;
+     qint64 backgroundTasks() const;
+     std::optional<bool> turnOpen() const;
+ 
+@@ -154,6 +164,7 @@ private:
+     const int _progressEndDelayMs;
+ 
+     Display _display;
++    std::optional<QString> _shownDetail;
+     qint64 _backgroundTasks = 0;
+     std::optional<bool> _turnOpen;
+ 
+diff --git a/src/plugins/ClaudeCode/statusnotifier.cpp b/src/plugins/ClaudeCode/statusnotifier.cpp
+index 29473fa..4072d24 100644
+--- a/src/plugins/ClaudeCode/statusnotifier.cpp
++++ b/src/plugins/ClaudeCode/statusnotifier.cpp
+@@ -73,7 +73,7 @@ void StatusNotifier::statusChanged(Konsole::Session *session, const std::optiona
+ 
+     auto *notification = new KNotification(event, KNotification::CloseWhenWindowActivated);
+     notification->setTitle(i18nc("@title a Claude Code session, named by its tab title", "Claude Code — %1", ClaudeCode::sessionTitle(session)));
+-    notification->setText(status->detail().value_or(fallbackText).toHtmlEscaped());
++    notification->setText(status->shownDetail().value_or(fallbackText).toHtmlEscaped());
+     const auto views = session->views();
+     if (!views.isEmpty() && views.first()->window()->windowHandle() != nullptr) {
+         notification->setWindow(views.first()->window()->windowHandle());
+-- 
+2.56.0
+

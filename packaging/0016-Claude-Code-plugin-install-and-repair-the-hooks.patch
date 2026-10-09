@@ -1,7 +1,7 @@
 From 48041fc65a4f1ee8f663459fc5dd5395b2e84e48 Mon Sep 17 00:00:00 2001
 From: Eric Duprey <509630+destinal@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 14:54:11 -0700
-Subject: [PATCH 16/17] Claude Code plugin: install and repair the hooks
+Subject: [PATCH 16/18] Claude Code plugin: install and repair the hooks
 
 konsole-claude-setup adds the hooks that drive the plugin to Claude
 Code's settings ($CLAUDE_CONFIG_DIR/settings.json, by default

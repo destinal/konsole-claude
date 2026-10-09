@@ -1,7 +1,7 @@
 From cc708d75c7d121a4b025865f9a7c7f0ba89cb147 Mon Sep 17 00:00:00 2001
 From: Eric Duprey <509630+destinal@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 12:55:33 -0700
-Subject: [PATCH 02/17] Add OSC 1337 SetUserVar
+Subject: [PATCH 02/18] Add OSC 1337 SetUserVar
 
 Programs can now attach variables to a session with the iTerm2 escape
 sequence OSC 1337 ; SetUserVar=<name>=<base64 value>, which WezTerm and

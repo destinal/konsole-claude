@@ -1,7 +1,7 @@
 From 94b6a374506a1de1f6dc64a781f7254aa620efe8 Mon Sep 17 00:00:00 2001
 From: Eric Duprey <509630+destinal@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 13:20:19 -0700
-Subject: [PATCH 05/17] Add SessionManager::sessionCreated
+Subject: [PATCH 05/18] Add SessionManager::sessionCreated
 
 Plugins that track every session need to know when one is created, not
 only when its view becomes active. A session restored into a background

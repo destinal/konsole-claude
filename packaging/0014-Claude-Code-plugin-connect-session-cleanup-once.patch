@@ -1,7 +1,7 @@
 From a5f57a887e5dafb3ca7a754adf47c3c5b0ecc141 Mon Sep 17 00:00:00 2001
 From: Eric Duprey <509630+destinal@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 14:50:28 -0700
-Subject: [PATCH 14/17] Claude Code plugin: connect session cleanup once
+Subject: [PATCH 14/18] Claude Code plugin: connect session cleanup once
 
 The notifier and the badges connected a lambda to a session's destroyed
 signal with Qt::UniqueConnection on every notification or badge. Qt

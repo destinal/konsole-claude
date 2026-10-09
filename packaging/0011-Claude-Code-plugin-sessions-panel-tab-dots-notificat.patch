@@ -1,7 +1,7 @@
 From 8cf7b140ca5fbba567d5dff06aa2f3c43aaea057 Mon Sep 17 00:00:00 2001
 From: Eric Duprey <509630+destinal@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 14:08:34 -0700
-Subject: [PATCH 11/17] Claude Code plugin: sessions panel, tab dots,
+Subject: [PATCH 11/18] Claude Code plugin: sessions panel, tab dots,
  notifications
 
 - The Claude Sessions panel lists every session that shows a status, in

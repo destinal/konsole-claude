@@ -1,7 +1,7 @@
 From 9834b9f8a98905beb96b8ac56dfff7a886b4b652 Mon Sep 17 00:00:00 2001
 From: Eric Duprey <509630+destinal@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 14:29:11 -0700
-Subject: [PATCH 13/17] Claude Code plugin: workgroups
+Subject: [PATCH 13/18] Claude Code plugin: workgroups
 
 A Claude Code workgroup, after iTerm2's: the session running Claude Code
 (Chat) with two more members, Diff and Code Review. They share the Chat

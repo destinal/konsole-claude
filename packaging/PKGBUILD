@@ -10,7 +10,7 @@
 pkgname=konsole-claude
 _pkgname=konsole
 pkgver=26.08.2
-pkgrel=1
+pkgrel=2
 arch=(x86_64)
 url='https://apps.kde.org/konsole/'
 pkgdesc='KDE terminal emulator, with a Claude Code integration'
@@ -63,23 +63,24 @@ source=(https://download.kde.org/stable/release-service/$pkgver/src/$_pkgname-$p
 source+=([0-9][0-9][0-9][0-9]-*.patch)
 sha256sums=('2154a03a952c29be435defffd4c88f9d2eff44a55cdfa33b16a8fc7bfd978217'
             'SKIP'
-            '33c9aef61a0a6818f2fd27fa7be490944a3beabab9a5cc78263eff665c821b06'
-            'ef762f8de9e372687aecfc6e1a45af52f890beed74ac0bc9debd597e9bad2dfe'
-            '602425cd0d8884de7022c487ecc2430bec02a49ba1dfee40ffb326ddadf4b953'
-            '9e9c5956be64b823cc7786ea0ee595f5513acd569efeb44059c8c4a54dc017d5'
-            'ccccdb2b39771181480bf7e5c9fc916f8ba07c84b8b8b0bf21624e6421275ad4'
-            '0997bad651696f499ec4cf59b2b29fb5f6681233c278c43a5de118a0573c27f8'
-            '6f50ed6e932aee3e2ddc72e49df4d4d54a86411d8232ff6a698a75e67d7f799d'
-            'f2524731d2967bfc313cfd9c7104de6b0b953a9fc861174df0da727830771be4'
-            '3add003005e8fffb5ac54e33ff2420b19b68998d503779615abecc1e71cc7b71'
-            'e8fbaf7e92a80c8be436444cfe0a8087acb74f22ce49822426e51630d6c0e90f'
-            'b3b0317e7497d141ccf267d6e1f84ae3ea4d93e8f5c7705532cbec86eee4c0c9'
-            '8afb4b67a78d4e8b1fa79424ff8b838a84a68d9e69df17bedbaba90c47d49f11'
-            '4fe3fc391b034d6987fb5ab64fd68555748cb5fb54ec8cdef1350d0570609461'
-            '399abb5049787fd984ccd60a7906f4763a5c7997dd4a65d67b4840b4cf252df3'
-            'e5b43b1d974d9d6fdb0906e14db02e84a3eacbbcfd1c39da9141e6c564a5c929'
-            '13ebc7f752ebf8f0d8f0bb83e55160f1b0c9ab298ea8923378fc3937b45be885'
-            'daae41c434191c217bf01719b27c1b47851dc3a345f49015e69184b2b65c516e')
+            'd35942c939e8ee68f56dda6fc5000fe17a3758f31daf1a17d857c6dd511c87a5'
+            '3696eb30b869ed16727ae26b81896fccaaf4c5770ac9bd679051e1cf1129c2e0'
+            'df1a3912cfe1c7bc4d9bc42b417904e3d9bab4bf23b14b46b08a33b1d71697ce'
+            'be7736d2c3ad39bc47b545b4d5656c5326c2bc06d46a248525925a503dbabb04'
+            '2f88adf5c6d84521d368c53dcd630e0c0f3d113ece869ba853a5729e48094076'
+            '26a031d01bd33abd17dfd757980f1d14cd2bdc9aafad830abdc166a2207f9344'
+            '8c92bd85b61e9579bbd7a1ec90127f120b6fc80a3aa7a584132fbb572dbed8c8'
+            '6df2ca3e1ddadf738cee92541e326be0c8eb2686da112b9e16b5acfe4ee8a09f'
+            '9f9337220f5bda7c9a8f7c9a317b0620aabdb6771a2cc5fb9287aedba10c6dc8'
+            '97a05bfa1dbdbf29f5d97d6ff9c8f255a5f36d0824f050850019e5d5d87bad5f'
+            'cafc9a41909718d2e558ec4abf5ff7c7bef203675a64868e74aae70a20a4dede'
+            '0f3ce2f20e38aac2c42a680005c7d4745ef8da8bc9feedd5c2381658cce681cb'
+            '1abeee0bad580630bc85366c21a72d5bf3d805b5dcd7df3d301fa66a653381f7'
+            'a069dca2988005ec2582fdd9d58a38e6adee97fa7529256bab9dcad659f3d728'
+            '4777ca10be9fc25126ddd1fff887b5d8fa0e08f92534e735198f85e26a44963e'
+            '4e9e2870a63acc3f9db4c0e79c593ec761a9986a164d721c4a8a26cc48838cfa'
+            '1a9be0686479d8afa22e1edd92dcd444f8fff89a6beb4c4513c4d0844324fc19'
+            'c30a59e7abdec4f393c69e2f884db6644ec1c42f1a5d6ec35e07cb1218dd75ff')
 validpgpkeys=(CA262C6C83DE4D2FB28A332A3A6A4DB839EAA6D7  # Albert Astals Cid <aacid@kde.org>
               F23275E4BF10AFC1DF6914A6DBD2CE893E2D1C87  # Christoph Feck <cfeck@kde.org>
               D81C0CB38EB725EF6691C385BB463350D6EF31EF) # Heiko Becker <heiko.becker@kde.org>
