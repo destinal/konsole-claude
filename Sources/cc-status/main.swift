@@ -40,6 +40,7 @@ func agentTTYPath() -> String? {
         return "/dev/tty"
     }
     var pid = getppid()
+#if canImport(Darwin)
     while pid > 1 {
         var info = kinfo_proc()
         var size = MemoryLayout<kinfo_proc>.size
@@ -53,8 +54,60 @@ func agentTTYPath() -> String? {
         }
         pid = info.kp_eproc.e_ppid
     }
+#else
+    // Linux: the same walk, reading each process's controlling terminal from
+    // /proc/<pid>/stat. After the command name, which is in parentheses and
+    // may itself contain spaces or parentheses, the fields are: state, ppid,
+    // pgrp, session, tty_nr.
+    while pid > 1 {
+        guard let stat = try? String(contentsOfFile: "/proc/\(pid)/stat", encoding: .utf8),
+              let close = stat.lastIndex(of: ")") else {
+            return nil
+        }
+        let fields = stat[stat.index(after: close)...].split(separator: " ")
+        guard fields.count > 4, let parent = Int32(fields[1]), let tty = UInt32(fields[4]) else {
+            return nil
+        }
+        if tty != 0, let path = ttyPath(device: tty) {
+            return path
+        }
+        pid = parent
+    }
+#endif
     return nil
 }
+
+#if !canImport(Darwin)
+/// The /dev path of the terminal with Linux device number `device` (the
+/// tty_nr encoding in /proc/<pid>/stat), or nil when there is no such node.
+func ttyPath(device: UInt32) -> String? {
+    let major = (device >> 8) & 0xfff
+    let minor = (device & 0xff) | ((device >> 12) & 0xfff00)
+    // Unix98 pseudo-terminals, which is what terminal emulators allocate.
+    if (136...143).contains(major) {
+        let path = "/dev/pts/\((major - 136) * 256 + minor)"
+        return FileManager.default.fileExists(atPath: path) ? path : nil
+    }
+    // Anything else (a virtual console, a serial line): find the node.
+    let wanted = UInt64(major) << 8 | UInt64(minor)
+    let entries = (try? FileManager.default.contentsOfDirectory(atPath: "/dev")) ?? []
+    for entry in entries where entry.hasPrefix("tty") {
+        var info = stat()
+        if stat("/dev/" + entry, &info) == 0, (info.st_mode & S_IFMT) == S_IFCHR,
+           UInt64(info.st_rdev) == gnuDeviceNumber(wanted) {
+            return "/dev/" + entry
+        }
+    }
+    return nil
+}
+
+/// Converts a traditional major << 8 | minor number to glibc's dev_t layout.
+func gnuDeviceNumber(_ device: UInt64) -> UInt64 {
+    let major = device >> 8
+    let minor = device & 0xff
+    return (major & 0xfff) << 8 | (major & ~0xfff) << 32 | (minor & 0xff) | (minor & ~0xff) << 12
+}
+#endif
 
 // MARK: - it2 resolution
 
