@@ -1,7 +1,7 @@
 From 35893d4cd1f5089e36cb71bc0ca2bfa8b593f661 Mon Sep 17 00:00:00 2001
 From: Eric Duprey <509630+destinal@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 15:17:13 -0700
-Subject: [PATCH 17/18] Mark the parts that come from iTerm2 GPL-2.0-only
+Subject: [PATCH 17/19] Mark the parts that come from iTerm2 GPL-2.0-only
 
 iTerm2 is GPL-2.0 without "or later", so the files ported from it are
 GPL-2.0-only, crediting George Nachman and the iTerm2 authors: the

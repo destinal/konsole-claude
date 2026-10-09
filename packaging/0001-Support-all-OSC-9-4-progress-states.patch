@@ -1,7 +1,7 @@
 From 891f931ec446a719b89d3f89cf0e1de01ee3f39d Mon Sep 17 00:00:00 2001
 From: Eric Duprey <509630+destinal@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 12:51:04 -0700
-Subject: [PATCH 01/18] Support all OSC 9;4 progress states
+Subject: [PATCH 01/19] Support all OSC 9;4 progress states
 
 Konsole treated the indeterminate state (OSC 9;4;3) the same as hiding
 progress and ignored the error and paused states. Programs such as

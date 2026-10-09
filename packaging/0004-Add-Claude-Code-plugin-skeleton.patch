@@ -1,7 +1,7 @@
 From 16682f0771a089fcfdc11884556e7b64862a58d1 Mon Sep 17 00:00:00 2001
 From: Eric Duprey <509630+destinal@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 13:13:56 -0700
-Subject: [PATCH 04/18] Add Claude Code plugin skeleton
+Subject: [PATCH 04/19] Add Claude Code plugin skeleton
 
 A plugin that will show the status of Claude Code sessions, modeled on
 iTerm2's Claude Code integration. This first version only proves the

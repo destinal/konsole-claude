@@ -1,7 +1,7 @@
 From f056da46ee2787ad63a80e785a6afc1b4fdb468b Mon Sep 17 00:00:00 2001
 From: Eric Duprey <509630+destinal@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 13:41:07 -0700
-Subject: [PATCH 07/18] Claude Code plugin: pass as ConEmu for progress reports
+Subject: [PATCH 07/19] Claude Code plugin: pass as ConEmu for progress reports
 
 Claude Code sends OSC 9;4 progress only to terminals it recognizes
 (ConEmu, Ghostty, iTerm2). Without the end of a turn, an interrupt, which

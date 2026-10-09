@@ -1,7 +1,7 @@
 From 778d07d20c4a1e69dd212d1de24fa870414e81c8 Mon Sep 17 00:00:00 2001
 From: Eric Duprey <509630+destinal@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 13:48:20 -0700
-Subject: [PATCH 08/18] Add the Program Status Protocol (OSC 7501)
+Subject: [PATCH 08/19] Add the Program Status Protocol (OSC 7501)
 
 A program reports what it is doing (idle, working, blocked on the user,
 done, or failed) with OSC 7501, and asks whether the terminal supports it

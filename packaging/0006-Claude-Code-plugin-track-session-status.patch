@@ -1,7 +1,7 @@
 From dab8003d961d3551ad537f295cb1e3cff1ab58aa Mon Sep 17 00:00:00 2001
 From: Eric Duprey <509630+destinal@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 13:39:33 -0700
-Subject: [PATCH 06/18] Claude Code plugin: track session status
+Subject: [PATCH 06/19] Claude Code plugin: track session status
 
 The plugin now keeps a status for every session, set the way iTerm2's
 Claude Code integration sets it, so that iTerm2's own hook, cc-status,

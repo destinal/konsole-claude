@@ -1,7 +1,7 @@
 From 2d59473f3905829678b32a9e766aed8e570d663a Mon Sep 17 00:00:00 2001
 From: Eric Duprey <509630+destinal@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 14:13:27 -0700
-Subject: [PATCH 12/18] Claude Code plugin: optional status badges
+Subject: [PATCH 12/19] Claude Code plugin: optional status badges
 
 Plugins > Show Status Badges shows each session's status as its badge,
 the label drawn in the terminal's top-right corner, on the status color.
