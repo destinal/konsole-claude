@@ -111,6 +111,10 @@ covers most of iTerm2's integration; not yet:
 
 - choosing a file or a git base for the diff (it always diffs against HEAD),
 - a status subtitle on tabs (there is a dot),
+- the turn's final reply while background work continues: a turn that ends
+  with a background task still running, even a hidden one such as a monitor
+  re-armed by `--resume`, shows a bare "done", because cc-status holds the
+  summary back until the work finishes,
 - tmux, and the hooks over ssh (Claude Code's own reports do work over ssh),
 - Codex CLI hooks, which `cc-status` supports but the setup does not install,
 - iTerm2's workgroup editor, git and usage toolbar items, and the Orchestrator.
