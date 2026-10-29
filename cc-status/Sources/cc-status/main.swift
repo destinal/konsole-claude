@@ -155,6 +155,14 @@ func resolveIt2() -> (executable: URL, leadingArgs: [String]) {
 ///
 /// excludingID drops the entry whose id matches: a SubagentStop payload
 /// still lists the agent that just stopped as "running".
+///
+/// Claude Code also lists the watch it keeps on each artifact the session
+/// published, as a "monitor" that is "running" for as long as the session
+/// lives and is re-armed on --resume (seen on 2.1.296 and 2.1.312). It is not
+/// work the session is waiting on, /tasks does not show it, and counting it
+/// would keep the session "working" for good, so it is left out. Its
+/// description is the only thing that tells it apart from a monitor the
+/// model started.
 func backgroundTaskCount(_ json: [String: Any], excludingID: String? = nil) -> Int? {
     guard let value = json["background_tasks"] else {
         return nil
@@ -167,6 +175,10 @@ func backgroundTaskCount(_ json: [String: Any], excludingID: String? = nil) -> I
         return array.filter { element in
             guard let dict = element as? [String: Any] else { return true }
             if let excludingID, let id = dict["id"] as? String, id == excludingID {
+                return false
+            }
+            if let description = dict["description"] as? String,
+               description.hasPrefix("live updates for artifact") {
                 return false
             }
             if let taskStatus = (dict["status"] as? String)?.lowercased(),

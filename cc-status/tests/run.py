@@ -492,6 +492,16 @@ SCENARIOS = {
         # is what the user has not seen yet.
         ("claude/Notification-idle", [get_status(), set_status(*DONE, *detail(""))]),
     ],
+    "claude: an artifact's live-update watch is not background work": [
+        # Claude Code lists it as a running monitor for the life of the session.
+        ("claude/Stop-artifact-watch", [set_status(*DONE, *detail("HELLO"), "--background-tasks=0")]),
+        ("claude/Notification-idle", [get_status()]),
+        expect_status("done"),
+    ],
+    "claude: real work next to an artifact's watch still counts": [
+        ("claude/Stop-artifact-watch-bg1", [set_status(*WORKING, *detail("1 background task running"),
+                                                       "--background-tasks=1")]),
+    ],
     "claude: payloads without background_tasks (before 2.1.198)": [
         ("claude/Stop-legacy", [set_status(*DONE, *detail("HELLO"))]),
         ("claude/SubagentStop-legacy", []),

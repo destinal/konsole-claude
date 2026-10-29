@@ -1,0 +1,30 @@
+{
+  "background_tasks": [
+    {
+      "description": "live updates for artifact https://claude.ai/artifact/AbCdEfGhIjKlMnOpQrStUv (re-armed on session resume)",
+      "id": "s0000test",
+      "status": "running",
+      "type": "monitor"
+    },
+    {
+      "agent_type": "general-purpose",
+      "description": "sleep then DONE",
+      "id": "agent-1",
+      "status": "running",
+      "type": "subagent"
+    }
+  ],
+  "cwd": "/home/user/project",
+  "effort": {
+    "level": "high"
+  },
+  "hook_event_name": "Stop",
+  "last_assistant_message": "SPAWNED",
+  "permission_mode": "default",
+  "prompt_id": "0b7e4f1a-6c2d-4e8b-9a35-2f1c7d9e0a44",
+  "scratchpad_dir": "/tmp/claude-1000/-home-user-project/5d3c8a2e-91f4-4b6a-8e27-c4a0f1d6b973/scratchpad",
+  "session_crons": [],
+  "session_id": "5d3c8a2e-91f4-4b6a-8e27-c4a0f1d6b973",
+  "stop_hook_active": false,
+  "transcript_path": "/home/user/.claude/projects/-home-user-project/5d3c8a2e-91f4-4b6a-8e27-c4a0f1d6b973.jsonl"
+}
