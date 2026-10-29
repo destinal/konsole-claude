@@ -10,7 +10,7 @@
 pkgname=konsole-claude
 _pkgname=konsole
 pkgver=26.08.2
-pkgrel=2
+pkgrel=3
 arch=(x86_64)
 url='https://apps.kde.org/konsole/'
 pkgdesc='KDE terminal emulator, with a Claude Code integration'
