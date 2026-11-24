@@ -1,7 +1,7 @@
 From cc4680e26a85eaf58007ee59a1fe064d51cce7fe Mon Sep 17 00:00:00 2001
 From: Eric Duprey <509630+destinal@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 16:22:53 -0700
-Subject: [PATCH 20/20] Claude Code plugin: forget a session's status when
+Subject: [PATCH 20/21] Claude Code plugin: forget a session's status when
  Claude Code exits
 
 When Claude Code exits it clears its OSC 7501 records, but its SessionEnd
@@ -190,5 +190,5 @@ index 2865c4d..9fddeaa 100644
  
      SessionStatusRegistry *_registry;
 -- 
-2.56.0
+2.53.0
 

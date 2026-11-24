@@ -1,7 +1,7 @@
 From c4a7e46e79812f75aa3b30672b3ae7b69cf283de Mon Sep 17 00:00:00 2001
 From: Eric Duprey <509630+destinal@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 16:10:28 -0700
-Subject: [PATCH 19/20] Claude Code plugin: wrap the detail in the sessions
+Subject: [PATCH 19/21] Claude Code plugin: wrap the detail in the sessions
  panel
 
 A turn's summary and a tool's description rarely fit one line. The detail
@@ -135,5 +135,5 @@ index 164f045..a230b19 100644
      connect(_list, &QListView::clicked, this, [this](const QModelIndex &index) {
          if (Konsole::Session *session = _model->session(index)) {
 -- 
-2.56.0
+2.53.0
 
