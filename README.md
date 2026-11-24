@@ -50,7 +50,7 @@ one needs you, and work with a diff and a code review next to the chat.
 
 The changes to Konsole are the `claude-integration` branch of
 [destinal/konsole](https://github.com/destinal/konsole/tree/claude-integration),
-20 commits on top of Konsole 26.08.2. [`packaging/`](packaging/)
+21 commits on top of Konsole 26.08.2. [`packaging/`](packaging/)
 holds the same changes as patches.
 
 ## Install (Arch Linux)
@@ -79,6 +79,91 @@ It only touches hooks that run `claude-code-hook`, and backs up
 `~/.claude/settings.json` first. To go back: `konsole-claude-setup uninstall`,
 then `sudo pacman -S konsole`.
 
+## Install (Kubuntu and other Debian-based systems)
+
+There is no package, so this builds Konsole into `~/.local/opt/konsole-claude`
+and starts it as `konsole-claude`, beside the distribution's `konsole`, which
+apt keeps updating. Tested on Kubuntu 26.04 (Qt 6.10, KDE Frameworks 6.24).
+
+Install the build dependencies:
+
+```sh
+sudo apt install extra-cmake-modules ninja-build qt6-base-dev qt6-multimedia-dev \
+  libkf6bookmarks-dev libkf6config-dev libkf6configwidgets-dev libkf6coreaddons-dev \
+  libkf6crash-dev libkf6dbusaddons-dev libkf6doctools-dev libkf6globalaccel-dev \
+  libkf6guiaddons-dev libkf6i18n-dev libkf6iconthemes-dev libkf6kio-dev \
+  libkf6newstuff-dev libkf6notifications-dev libkf6notifyconfig-dev libkf6parts-dev \
+  libkf6pty-dev libkf6service-dev libkf6textwidgets-dev libkf6widgetsaddons-dev \
+  libkf6windowsystem-dev libkf6xmlgui-dev libicu-dev libssh-dev libxkbcommon-dev
+```
+
+Install Swift for `cc-status` with [swiftly](https://www.swift.org/install/linux/),
+which puts it in your home directory. It is only needed to build:
+
+```sh
+curl -O https://download.swift.org/swiftly/linux/swiftly-$(uname -m).tar.gz
+tar zxf swiftly-$(uname -m).tar.gz
+./swiftly init --no-modify-profile
+. ~/.local/share/swiftly/env.sh
+```
+
+swiftly lists some system packages for the toolchain; building `cc-status`
+did not need them.
+
+Download Konsole, check it against the first checksum in
+[`packaging/PKGBUILD`](packaging/PKGBUILD), and apply the patches:
+
+```sh
+git clone https://github.com/destinal/konsole-claude
+curl -O https://download.kde.org/stable/release-service/26.08.2/src/konsole-26.08.2.tar.xz
+sha256sum konsole-26.08.2.tar.xz
+tar xf konsole-26.08.2.tar.xz
+cd konsole-26.08.2
+for p in ../konsole-claude/packaging/0*.patch; do patch -Np1 -i "$p"; done
+```
+
+Build and install Konsole, then `cc-status` beside the plugin's hook:
+
+```sh
+prefix=~/.local/opt/konsole-claude
+cmake -G Ninja -B build -DCMAKE_INSTALL_PREFIX=$prefix -DBUILD_TESTING=OFF
+cmake --build build
+cmake --install build
+
+cd ../konsole-claude/cc-status
+swift build -c release --static-swift-stdlib \
+  -Xlinker -lCoreFoundation -Xlinker -l_FoundationICU -Xlinker -l_FoundationCShims \
+  -Xlinker -l_FoundationCollections -Xlinker -lFoundationEssentials \
+  -Xlinker -lFoundationInternationalization -Xlinker -lswiftSynchronization
+install -Dm755 .build/release/cc-status \
+  $prefix/lib/x86_64-linux-gnu/libexec/konsole-claudecode/cc-status
+```
+
+Konsole outside `/usr` needs to be told where its libraries and plugins are.
+Save this as `~/.local/bin/konsole-claude` and make it executable:
+
+```sh
+#!/bin/sh
+P="$HOME/.local/opt/konsole-claude"
+LIB="$P/lib/x86_64-linux-gnu"
+export LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export QT_PLUGIN_PATH="$LIB/plugins${QT_PLUGIN_PATH:+:$QT_PLUGIN_PATH}"
+export XDG_DATA_DIRS="$P/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+exec "$P/bin/konsole" "$@"
+```
+
+Then add the hooks and start it:
+
+```sh
+ln -s ~/.local/opt/konsole-claude/bin/konsole-claude-setup ~/.local/bin/
+konsole-claude-setup install
+konsole-claude
+```
+
+The hook does nothing in the distribution's Konsole or any other terminal. To go
+back: `konsole-claude-setup uninstall`, then remove `~/.local/opt/konsole-claude`,
+`~/.local/bin/konsole-claude` and `~/.local/bin/konsole-claude-setup`.
+
 ## Using it
 
 | | |
@@ -106,7 +191,8 @@ the patches and the PKGBUILD. Then build the package as above.
 
 ## Status
 
-Built and tested on CachyOS with Konsole 26.08.2 and Claude Code 2.1.296. It
+Built and tested on CachyOS with Konsole 26.08.2 and Claude Code 2.1.296, and
+built on Kubuntu 26.04 as above. It
 covers most of iTerm2's integration; not yet:
 
 - choosing a file or a git base for the diff (it always diffs against HEAD),
